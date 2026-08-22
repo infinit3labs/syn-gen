@@ -223,6 +223,20 @@ MAX_KEY_COLUMNS = 3
 # handful of them.
 MAX_COMPOSITE_UNIQUE_CONSTRAINTS = 3
 
+# Functional-dependency discovery is OFF by default, and that is a considered
+# choice rather than caution. FD discovery is the most expensive thing in this
+# module -- on the 208k-row CFPB source it is the difference between a 3.6 s
+# and a ~40 s profile -- and unlike key and foreign-key discovery its output
+# does not currently steer generation (see the commit that removed
+# ``suggested_depends_on`` for exactly why it cannot yet). Paying forty seconds
+# by default for a report nothing consumes would be the wrong trade; paying it
+# on request, to understand a dataset before editing its spec, is a good one.
+DEFAULT_DISCOVER_FDS = False
+
+# Cap on functional dependencies recorded in a spec, strongest first. A wide
+# table can yield hundreds; a spec is something a human reads and edits.
+MAX_RECORDED_FDS = 50
+
 
 # Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
 DEFAULT_MAX_CATEGORICAL = 50
@@ -538,6 +552,7 @@ class DatasetProfiler:
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
         discover: Optional[bool] = DEFAULT_DISCOVER,
+        discover_fds: bool = DEFAULT_DISCOVER_FDS,
         fd_error: float = discovery.DEFAULT_FD_ERROR,
         fd_min_mu: float = discovery.DEFAULT_MIN_MU,
         ind_error: float = discovery.DEFAULT_IND_ERROR,
@@ -561,6 +576,7 @@ class DatasetProfiler:
         self.discover = (
             discovery.is_available() if discover is None else bool(discover)
         )
+        self.discover_fds = bool(discover_fds) and self.discover
         self.fd_error = fd_error
         self.fd_min_mu = fd_min_mu
         self.ind_error = ind_error
@@ -682,6 +698,7 @@ class DatasetProfiler:
         uccs = self._discover_uccs(df)
         pk, key_prov = self._detect_pk(cols, uccs, source_rows)
         unique_constraints = self._composite_unique_constraints(uccs, pk)
+        fds = self._discover_fds(df)
         # ``row_count`` is the size of the SOURCE dataset, not of whatever
         # sample we happened to read. It is the contract "a dataset of this
         # shape has this many rows", and ``syntab check`` compares generated
@@ -711,7 +728,9 @@ class DatasetProfiler:
                     **({"identifying_key_candidates":
                         list(self.identifying_key_candidates)}
                        if self.identifying_key_candidates else {}),
-                }
+                },
+                **({"discovery": {"functional_dependencies": fds}}
+                   if fds else {}),
             },
         )
 
@@ -730,6 +749,7 @@ class DatasetProfiler:
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
         discover: Optional[bool] = DEFAULT_DISCOVER,
+        discover_fds: bool = DEFAULT_DISCOVER_FDS,
         fd_error: float = discovery.DEFAULT_FD_ERROR,
         fd_min_mu: float = discovery.DEFAULT_MIN_MU,
         ind_error: float = discovery.DEFAULT_IND_ERROR,
@@ -752,7 +772,8 @@ class DatasetProfiler:
                    pii_columns=pii_columns, pii_strategy=pii_strategy,
                    redact_categoricals=redact_categoricals,
                    min_cell_count=min_cell_count,
-                   discover=discover, fd_error=fd_error, fd_min_mu=fd_min_mu,
+                   discover=discover, discover_fds=discover_fds,
+                   fd_error=fd_error, fd_min_mu=fd_min_mu,
                    ind_error=ind_error,
                    discovery_sample_rows=discovery_sample_rows,
                    discovery_max_lhs=discovery_max_lhs)
@@ -770,7 +791,6 @@ class DatasetProfiler:
         )
         for t, rel_list in rels.items():
             table_specs[t].relationships = rel_list
-        cls._infer_depends_on(table_specs, tables)
         meta = SpecMetadata(
             name=name or "profiled_set",
             description="Profiled from multiple related tables",
@@ -1126,63 +1146,6 @@ class DatasetProfiler:
                         }))
                         break
         return rels
-
-    # |r| above which two numeric columns are reported as related.
-    _DEPENDS_ON_R = 0.95
-
-    @classmethod
-    def _infer_depends_on(
-        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
-    ) -> None:
-        """Record strongly correlated numeric column pairs as a hint.
-
-        This was a double loop running ``df[[a, b]].dropna().corr()`` once per
-        pair: O(C^2) pandas round-trips, each slicing a two-column frame,
-        copying it, dropping rows and building a 2x2 result, to read a single
-        number off it -- for a quantity the whole correlation matrix produces
-        in one call. 40 numeric columns meant 780 of those.
-
-        ``DataFrame.corr`` uses pairwise-complete observations, which is
-        exactly what the per-pair ``dropna()`` was doing, so the values are
-        unchanged; ``tests/test_profiler_depends_on.py`` asserts equivalence
-        against a reference implementation of the old loop.
-
-        NOTE: the output of this method -- ``metadata.suggested_depends_on``
-        -- is read by nothing in this package. Not the generation engine, not
-        ``infer.resolve_generator``, not the conformance checker, not the CLI.
-        It is computed, written into the spec, serialized, and never consulted.
-        It is kept here rather than deleted because whether it should become a
-        real feature (feeding ``ColumnSpec.depends_on``) or be dropped is a
-        product decision, not a correctness fix.
-        """
-        for t, cts in table_specs.items():
-            df = dfs[t]
-            num_cols = [c.name for c in cts.columns
-                        if c.dtype in ("int", "float") and c.name in df.columns]
-            if len(num_cols) < 2:
-                continue
-
-            matrix = df[num_cols].corr(numeric_only=True)
-            cols = list(matrix.columns)
-            if len(cols) < 2:
-                continue
-            # A constant column correlates with nothing and yields NaN; treat
-            # that as "no relationship" rather than letting it propagate.
-            values = np.nan_to_num(np.abs(matrix.to_numpy()), nan=0.0)
-
-            rows, cols_idx = np.triu_indices(len(cols), k=1)
-            strong = values[rows, cols_idx] > cls._DEPENDS_ON_R
-
-            sugg: Dict[str, List[str]] = {}
-            for i, j in zip(rows[strong], cols_idx[strong]):
-                a, b = cols[int(i)], cols[int(j)]
-                sugg.setdefault(a, []).append(b)
-                sugg.setdefault(b, []).append(a)
-
-            if sugg:
-                md = dict(cts.metadata or {})
-                md["suggested_depends_on"] = sugg
-                cts.metadata = md
 
     # ----- internals -----
     @staticmethod
@@ -1540,6 +1503,40 @@ class DatasetProfiler:
             )
         except discovery.DiscoveryUnavailable:
             return None
+
+    def _discover_fds(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Functional dependencies of the source table, with provenance.
+
+        HyFD for the exact ones and Pyro for the approximate ones, filtered by
+        mu\' -- see ``syntab.discovery``, which cites all three. Recorded under
+        ``metadata.discovery`` because ``metadata`` is the free-form provenance
+        dict a TableSpec already has; no new schema field is introduced for a
+        result that does not yet steer generation.
+
+        THIS REPLACES ``metadata.suggested_depends_on``, which held pairs of
+        Pearson-correlated numeric columns. Correlation is not dependency: it
+        is symmetric where a dependency has a direction, it is defined only
+        between numeric columns so it could never see ZIP code -> State, and
+        a coefficient above 0.95 is not evidence that one column determines
+        another. That field is gone; this is what a real answer looks like.
+        """
+        if not self.discover_fds:
+            return []
+        try:
+            found = discovery.discover_functional_dependencies(
+                df,
+                error=self.fd_error,
+                min_mu=self.fd_min_mu,
+                max_lhs=self.discovery_max_lhs,
+                sample_rows=self.discovery_sample_rows,
+                seed=self.seed,
+            )
+        except discovery.DiscoveryUnavailable:
+            return []
+        # Strongest first, so a truncated list is the useful part of the list.
+        found.sort(key=lambda f: (-(f.mu_prime or 1.0), len(f.determinant),
+                                  f.determinant, f.dependent))
+        return [f.as_dict() for f in found[:MAX_RECORDED_FDS]]
 
     def _composite_unique_constraints(
         self, uccs: Optional[List[Any]], pk: Optional[Any]
