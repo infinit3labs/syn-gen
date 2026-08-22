@@ -162,16 +162,40 @@ class DatasetProfiler:
         )
 
     def _build_table_spec(self, df: pd.DataFrame, name: str, source: str) -> TableSpec:
-        if self.sample and len(df) > self.sample:
-            df = df.sample(n=self.sample, random_state=self.seed)
-        n = len(df)
+        source_rows = len(df)
+        if self.sample and source_rows > self.sample:
+            sdf = df.sample(n=self.sample, random_state=self.seed)
+        else:
+            sdf = df
+        n = len(sdf)
         cols: List[ColumnSpec] = []
         for c in df.columns:
-            spec = self._profile_column(str(c), df[c], n)
+            spec = self._profile_column(str(c), sdf[c], n)
             if spec is not None:
                 cols.append(spec)
         pk = self._detect_pk(cols)
-        return TableSpec(name=name, row_count=n, primary_key=pk, columns=cols)
+        # ``row_count`` is the size of the SOURCE dataset, not of whatever
+        # sample we happened to read. It is the contract "a dataset of this
+        # shape has this many rows", and ``syntab check`` compares generated
+        # output against it. Recording the sample size here silently shrank
+        # every profiled dataset to --sample rows, and the conformance check
+        # then certified the truncated result as correct.
+        #
+        # How much was actually read is provenance, so it is recorded
+        # separately under ``metadata.profiling``. Nothing compares against it.
+        return TableSpec(
+            name=name,
+            row_count=source_rows,
+            primary_key=pk,
+            columns=cols,
+            metadata={
+                "profiling": {
+                    "source_row_count": source_rows,
+                    "sampled_rows": n,
+                    "sampled": n < source_rows,
+                }
+            },
+        )
 
     @classmethod
     def profile_set(
