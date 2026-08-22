@@ -536,6 +536,104 @@ def pii_name_signal(name: str) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Re-profiling without destroying hand edits
+# ---------------------------------------------------------------------------
+# Profiling is meant to be iterative: profile, read the spec, correct what the
+# algorithms got wrong, profile again with a better sample or a looser
+# threshold. Until now the second step threw away the third -- ``profile``
+# writes a whole new file and every correction went with it, which makes the
+# loop unusable and is why people stop after one pass.
+#
+# The mechanism is drift detection, not a diff. Each inferred rule is written
+# with a fingerprint of the value the profiler itself produced. On a re-profile
+# the fingerprint is compared against what the spec now says:
+#
+#   value == fingerprint   -> nobody touched it; the new inference wins
+#   value != fingerprint   -> a human changed it; keep the human's value and
+#                             mark it human_edited so it is never silently
+#                             re-inferred again
+#   no provenance at all   -> hand-authored, or written before this existed;
+#                             keep it, on the principle that an unexplained
+#                             rule is more likely a person's than a machine's
+#
+# Scope: this covers what discovery writes -- the primary key and the
+# relationships. Column-level edits (a corrected dtype, a pii flag, an edited
+# categorical distribution) are NOT preserved yet; see the PR description.
+
+
+def _provenance_is_stale(prov, current_value) -> bool:
+    """Whether ``current_value`` differs from what the profiler last wrote."""
+    if prov is None or not prov.fingerprint:
+        return False
+    return prov.fingerprint != _fingerprint(current_value)
+
+
+def _mark_edited(prov: Optional[InferenceProvenance]) -> InferenceProvenance:
+    if prov is None:
+        return InferenceProvenance(algorithm="human", human_edited=True)
+    updated = prov.model_copy(deep=True)
+    updated.human_edited = True
+    return updated
+
+
+def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
+    """Fold a fresh profile into an existing spec, keeping human corrections.
+
+    Returns a new Spec; neither argument is mutated. Tables and relationships
+    the fresh profile found but the existing spec does not have are added --
+    the point of re-profiling is to learn something new, so a merge that only
+    ever preserved would be as useless as one that only ever overwrote.
+    """
+    merged = profiled.model_copy(deep=True)
+    old_tables = {t.name: t for t in existing.tables}
+
+    for table in merged.tables:
+        old = old_tables.get(table.name)
+        if old is None:
+            continue
+
+        # ----- primary key -----
+        keep_key = (
+            old.primary_key is not None
+            and (old.key_provenance is None
+                 or old.key_provenance.human_edited
+                 or _provenance_is_stale(old.key_provenance, old.primary_key))
+        )
+        if keep_key:
+            table.primary_key = old.primary_key
+            table.key_provenance = _mark_edited(old.key_provenance)
+
+        # ----- relationships, matched on the child column(s) -----
+        old_rels = {tuple(r.child_columns): r for r in old.relationships}
+        kept: Dict[tuple, RelationshipSpec] = {}
+        for key, rel in old_rels.items():
+            # The fingerprint a discovered relationship carries is over
+            # [child column, "parent.column"], so that is what is re-derived.
+            edited = (
+                rel.provenance is None
+                or rel.provenance.human_edited
+                or _provenance_is_stale(rel.provenance, [rel.from_, rel.to])
+            )
+            if edited:
+                preserved = rel.model_copy(deep=True)
+                preserved.provenance = _mark_edited(rel.provenance)
+                kept[key] = preserved
+
+        fresh = [r for r in table.relationships
+                 if tuple(r.child_columns) not in kept]
+        table.relationships = list(kept.values()) + fresh
+
+    # Tables the existing spec has and the fresh profile does not are kept:
+    # a source that was not re-read is not a source that went away.
+    profiled_names = {t.name for t in merged.tables}
+    for name, old in old_tables.items():
+        if name not in profiled_names:
+            merged.tables.append(old.model_copy(deep=True))
+
+    return merged
+
+
 class DatasetProfiler:
     def __init__(
         self,
