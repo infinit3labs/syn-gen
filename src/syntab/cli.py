@@ -13,6 +13,11 @@ from . import formats
 from . import generators
 from .engine import GenerationEngine, SpecError
 from .loaders import from_file, spec_to_dict, to_file
+from .profiler import (
+    DEFAULT_MAX_CATEGORICAL,
+    DEFAULT_MAX_CATEGORICAL_RATIO,
+    DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
+)
 from .spec import Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings
 
 
@@ -133,14 +138,31 @@ def validate(spec_path: str) -> None:
 @click.argument("datasets", nargs=-1, required=True)
 @click.option("--out", "out", required=True, help="Output Spec path (YAML or JSON).")
 @click.option("--name", default=None, help="Dataset/set name.")
-@click.option("--sample", default=5000, type=int, help="Rows to sample for profiling.")
+@click.option("--sample", default=5000, type=int, show_default=True,
+              help="Rows to sample for profiling. Row counts, nullability and "
+                   "uniqueness are always measured on the full dataset.")
 @click.option("--seed", default=42, type=int, help="Seed for sampling + generation.")
+@click.option("--max-categorical", "max_categorical",
+              default=DEFAULT_MAX_CATEGORICAL, type=int, show_default=True,
+              help="A column with at most this many distinct values is "
+                   "profiled as categorical -- its real values and their "
+                   "frequencies are written into the spec -- instead of being "
+                   "treated as free text. Raising it captures more real "
+                   "categoricals and embeds more real values in the spec.")
+@click.option("--max-categorical-ratio", "max_categorical_ratio",
+              default=DEFAULT_MAX_CATEGORICAL_RATIO, type=float, show_default=True,
+              help="Also treat a column as categorical when its distinct count "
+                   f"is at most this fraction of the rows (hard cap: "
+                   f"{DEFAULT_MAX_CATEGORICAL_RATIO_CAP} distinct values). "
+                   "Catches genuine categoricals that exceed "
+                   "--max-categorical in absolute terms.")
 @click.option("--pii", "pii", default=None,
               help="Comma-separated column names to treat as PII.")
 @click.option("--pii-strategy", "pii_strategy", default="faker",
               type=click.Choice(["faker", "mask", "redact", "hash"]),
               help="Anonymization strategy for --pii columns.")
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
+            max_categorical: int, max_categorical_ratio: float,
             pii: str, pii_strategy: str) -> None:
     """Profile one or more datasets into a Spec.
 
@@ -148,26 +170,33 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     datasets, foreign-key relationships between them are inferred. Columns
     named via --pii are flagged PII and anonymized (default: faker substitution,
     so no real value is ever baked into the spec).
+
+    Note that a categorical column's real values and their exact frequencies
+    ARE written into the output spec. Treat a profiled spec as derived from the
+    source data, not as source code, and review it before sharing it.
     """
     from .profiler import DatasetProfiler
 
     pii_cols = [c.strip() for c in (pii or "").split(",") if c.strip()] or None
+    thresholds = dict(max_categorical=max_categorical,
+                      max_categorical_ratio=max_categorical_ratio)
     if len(datasets) == 1:
         profiler = DatasetProfiler.from_file(
             datasets[0], name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy,
+            pii_columns=pii_cols, pii_strategy=pii_strategy, **thresholds,
         )
         spec = profiler.profile()
     else:
         dfs = {}
         for d in datasets:
             profiler = DatasetProfiler.from_file(
-                d, sample=sample, seed=seed, pii_columns=pii_cols, pii_strategy=pii_strategy
+                d, sample=sample, seed=seed, pii_columns=pii_cols,
+                pii_strategy=pii_strategy, **thresholds,
             )
             dfs[profiler.name] = profiler.full
         spec = DatasetProfiler.profile_set(
             dfs, name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy,
+            pii_columns=pii_cols, pii_strategy=pii_strategy, **thresholds,
         )
     to_file(spec, out)
     n_rel = sum(len(t.relationships) for t in spec.tables)

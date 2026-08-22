@@ -79,6 +79,11 @@ _NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # Trailing tokens that mark a column as an identifier.
 _ID_TOKENS = {"id", "uuid", "guid"}
 
+# Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
+DEFAULT_MAX_CATEGORICAL = 50
+DEFAULT_MAX_CATEGORICAL_RATIO = 0.05
+DEFAULT_MAX_CATEGORICAL_RATIO_CAP = 500
+
 
 def _name_tokens(name: str) -> List[str]:
     return _NAME_TOKEN_RE.findall(name or "")
@@ -120,7 +125,9 @@ class DatasetProfiler:
         source: Optional[str] = None,
         sample: Optional[int] = 5000,
         seed: Optional[int] = None,
-        max_categorical: int = 50,
+        max_categorical: int = DEFAULT_MAX_CATEGORICAL,
+        max_categorical_ratio: float = DEFAULT_MAX_CATEGORICAL_RATIO,
+        max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
     ):
@@ -130,6 +137,8 @@ class DatasetProfiler:
         self.sample = sample
         self.seed = seed
         self.max_categorical = max_categorical
+        self.max_categorical_ratio = max_categorical_ratio
+        self.max_categorical_ratio_cap = max_categorical_ratio_cap
         self.pii_columns = set(pii_columns or [])
         self.pii_strategy = pii_strategy
 
@@ -251,7 +260,9 @@ class DatasetProfiler:
         name: Optional[str] = None,
         sample: Optional[int] = 5000,
         seed: Optional[int] = None,
-        max_categorical: int = 50,
+        max_categorical: int = DEFAULT_MAX_CATEGORICAL,
+        max_categorical_ratio: float = DEFAULT_MAX_CATEGORICAL_RATIO,
+        max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
     ) -> Spec:
@@ -263,7 +274,10 @@ class DatasetProfiler:
         recorded as ``metadata.suggested_depends_on`` hints (non-breaking).
         """
         profilers = {
-            t: cls(df, name=t, sample=sample, seed=seed, max_categorical=max_categorical,
+            t: cls(df, name=t, sample=sample, seed=seed,
+                   max_categorical=max_categorical,
+                   max_categorical_ratio=max_categorical_ratio,
+                   max_categorical_ratio_cap=max_categorical_ratio_cap,
                    pii_columns=pii_columns, pii_strategy=pii_strategy)
             for t, df in tables.items()
         }
@@ -566,10 +580,12 @@ class DatasetProfiler:
 
         # categorical vs free text
         n_unique = int(vals.nunique())
-        ratio = n_unique / len(vals)
-        if ratio < 0.5 and n_unique <= self.max_categorical:
+        if self._is_categorical(n_unique, len(vals)):
             counts = vals.value_counts()
-            chosen = counts.head(self.max_categorical)
+            # _is_categorical already bounds n_unique; head() is a belt-and-
+            # braces guard so a future caller cannot make the profiler write an
+            # unbounded number of real values into a spec file.
+            chosen = counts.head(self._categorical_value_cap)
             total = float(chosen.sum())
             values = {str(k): round(float(v) / total, 4) for k, v in chosen.items()}
             return "str", ColumnProfile(
@@ -582,6 +598,44 @@ class DatasetProfiler:
         if lengths.max() <= 30:
             prof.string_pattern = _string_pattern(vals.head(50).tolist())
         return "str", prof
+
+    @property
+    def _categorical_value_cap(self) -> int:
+        """Hard ceiling on how many distinct values may be written to a spec."""
+        return max(self.max_categorical, self.max_categorical_ratio_cap)
+
+    def _is_categorical(self, n_unique: int, n: int) -> bool:
+        """Decide categorical vs free text for a string column.
+
+        Two independent tests, either of which is sufficient.
+
+        Absolute: at most ``max_categorical`` distinct values, and fewer than
+        half the rows. This is the original rule and it covers the small fixed
+        domain -- a status, a country code, a response category. The 0.5 guard
+        stops a tiny frame whose rows are nearly all distinct from being
+        called categorical.
+
+        Ratio: the distinct count is at most ``max_categorical_ratio`` of the
+        rows, capped at ``max_categorical_ratio_cap`` distinct values. A fixed
+        absolute cutoff is simply wrong at scale -- 300 distinct product codes
+        across 5M rows is unambiguously categorical, but 300 > 50, so the
+        column fell through to the free-text branch and was re-synthesized as
+        random characters with the right string length and nothing else. Low
+        cardinality *relative to row count* is the standard way to make that
+        call; the cap is what keeps the emitted spec bounded in size, and
+        bounds how many real values it embeds.
+
+        Raising ``max_categorical`` increases the number of real source values
+        written verbatim into the spec file. That is the intended trade-off,
+        but it is a disclosure trade-off, not only a fidelity one.
+        """
+        if n <= 0:
+            return False
+        ratio = n_unique / n
+        if n_unique <= self.max_categorical and ratio < 0.5:
+            return True
+        return (ratio <= self.max_categorical_ratio
+                and n_unique <= self.max_categorical_ratio_cap)
 
     def _numeric_profile(self, s: pd.Series) -> NumericProfile:
         smin = float(s.min())
