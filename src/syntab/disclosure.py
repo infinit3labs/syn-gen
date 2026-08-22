@@ -248,9 +248,14 @@ class DisclosureReport:
                      " outside the")
             L.append(" boundary the source data lives in. Synthetic data is not"
                      " automatically")
-            L.append(" anonymous -- see docs/disclosure.md.")
+            L.append(" anonymous.")
         else:
             L.append(" No real source values are embedded in this spec.")
+        # Always cited, in both branches: the reader of a clean notice is
+        # exactly the person who should know what the controls are for before
+        # the next profile run, which may not be clean.
+        L.append(" What a spec contains, and what these controls do:"
+                 " docs/disclosure.md")
         L.append(_RULE)
         return "\n".join(L)
 
