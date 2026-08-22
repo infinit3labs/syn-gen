@@ -89,7 +89,21 @@ def resolve_generator(col: ColumnSpec) -> Tuple[Optional[str], dict]:
         return "regex", params
 
     if prof.length is not None:
-        params.setdefault("length", prof.length[1])
+        # The observed RANGE, not the maximum. Passing prof.length[1] as a
+        # scalar `length` pinned every generated value to the longest length
+        # in the source; `min_length`/`max_length` let the string generator
+        # sample across the range instead.
+        #
+        # This is still only the range. The full observed length distribution
+        # and the source character distribution are what text generation
+        # really wants, and neither is carried on ColumnProfile today --
+        # generators.empirical_text_params() computes both in the form the
+        # string generator consumes, and anything already present in
+        # col.params is passed straight through, so a profiler can supply
+        # them without a spec schema change (params is free-form).
+        lo, hi = prof.length
+        params.setdefault("min_length", lo)
+        params.setdefault("max_length", hi)
         return "string", params
 
     # Last resort: dtype default.
