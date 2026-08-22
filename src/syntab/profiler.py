@@ -289,8 +289,59 @@ class DatasetProfiler:
         )
 
     @staticmethod
+    def _value_kind(s: pd.Series) -> str:
+        """Coarse comparability class of a column, for foreign-key matching.
+
+        Two columns are only candidates for a key relationship if they hold
+        the same kind of value. Note that ``is_numeric_dtype`` is true of a
+        boolean column, so bool has to be tested first.
+        """
+        if pd.api.types.is_bool_dtype(s):
+            return "bool"
+        if pd.api.types.is_numeric_dtype(s):
+            return "numeric"
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return "datetime"
+        return "string"
+
+    @classmethod
+    def _key_values(cls, s: pd.Series) -> set:
+        """The distinct key values of a column, compared on their own type.
+
+        This used to be ``{str(v) for v in col.dropna().unique()}`` on both
+        sides of the containment test, which is wrong in both directions:
+
+        * a nullable foreign key is held by pandas in a float64 column, so a
+          child value of 1 stringifies to ``"1.0"`` while the parent's int64 1
+          stringifies to ``"1"``. The subset test failed and the relationship
+          was silently dropped -- and a nullable FK is the ordinary case, not
+          an edge case;
+        * in the other direction, columns of genuinely different types could
+          be matched because their string forms happened to coincide.
+
+        So: integral numerics are normalized to int, and columns of different
+        kinds are never compared at all.
+        """
+        s = s.dropna()
+        kind = cls._value_kind(s)
+        if kind == "bool":
+            return set(s.astype(bool).tolist())
+        if kind == "numeric":
+            vals = s.astype("float64")
+            # 2**53 is the largest integer float64 represents exactly. Past
+            # that the float is already lossy, so narrowing to int would be
+            # inventing precision rather than recovering it.
+            if len(vals) and bool((vals % 1 == 0).all()) \
+                    and float(vals.abs().max()) < 2 ** 53:
+                return set(vals.astype("int64").tolist())
+            return set(vals.tolist())
+        if kind == "datetime":
+            return set(pd.to_datetime(s).tolist())
+        return set(s.astype(str).tolist())
+
+    @classmethod
     def _infer_relationships(
-        table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
+        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
     ) -> Dict[str, List[RelationshipSpec]]:
         rels: Dict[str, List[RelationshipSpec]] = {t: [] for t in table_specs}
         names = set(table_specs)
@@ -298,23 +349,34 @@ class DatasetProfiler:
             cdf = dfs[cname]
             for col in cts.columns:
                 colname = col.name
-                if colname == "id" or not colname.endswith("_id"):
+                if colname not in cdf.columns:
                     continue
-                base = colname[:-3]
-                candidates = [b for b in (base, base + "s", base.rstrip("s"))
+                # Token-aware, so camelCase and spaced names work too; returns
+                # None for a bare "id" or a non-identifier name.
+                base = _id_base(colname)
+                if not base:
+                    continue
+                singular = base[:-1] if base.endswith("s") else base
+                candidates = [b for b in (base, base + "s", singular)
                               if b in names and b != cname]
                 if not candidates:
                     continue
-                child_vals = {str(v) for v in cdf[colname].dropna().unique()}
+                child = cdf[colname]
+                child_vals = cls._key_values(child)
                 if not child_vals:
                     continue
+                child_kind = cls._value_kind(child)
                 for pname in candidates:
-                    pts = table_specs[pname]
-                    pkp = pts.primary_key
-                    if not pkp:
+                    pkp = table_specs[pname].primary_key
+                    if not isinstance(pkp, str):
+                        continue  # no key, or a composite one
+                    pdf = dfs[pname]
+                    if pkp not in pdf.columns:
                         continue
-                    parent_vals = {str(v) for v in dfs[pname][pkp].dropna().unique()}
-                    if child_vals.issubset(parent_vals):
+                    parent = pdf[pkp]
+                    if cls._value_kind(parent) != child_kind:
+                        continue
+                    if child_vals.issubset(cls._key_values(parent)):
                         rels[cname].append(RelationshipSpec(
                             **{"from": colname, "to": f"{pname}.{pkp}", "alias": pname}
                         ))
