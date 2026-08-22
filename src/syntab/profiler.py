@@ -383,25 +383,58 @@ class DatasetProfiler:
                         break
         return rels
 
-    @staticmethod
+    # |r| above which two numeric columns are reported as related.
+    _DEPENDS_ON_R = 0.95
+
+    @classmethod
     def _infer_depends_on(
-        table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
+        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
     ) -> None:
+        """Record strongly correlated numeric column pairs as a hint.
+
+        This was a double loop running ``df[[a, b]].dropna().corr()`` once per
+        pair: O(C^2) pandas round-trips, each slicing a two-column frame,
+        copying it, dropping rows and building a 2x2 result, to read a single
+        number off it -- for a quantity the whole correlation matrix produces
+        in one call. 40 numeric columns meant 780 of those.
+
+        ``DataFrame.corr`` uses pairwise-complete observations, which is
+        exactly what the per-pair ``dropna()`` was doing, so the values are
+        unchanged; ``tests/test_profiler_depends_on.py`` asserts equivalence
+        against a reference implementation of the old loop.
+
+        NOTE: the output of this method -- ``metadata.suggested_depends_on``
+        -- is read by nothing in this package. Not the generation engine, not
+        ``infer.resolve_generator``, not the conformance checker, not the CLI.
+        It is computed, written into the spec, serialized, and never consulted.
+        It is kept here rather than deleted because whether it should become a
+        real feature (feeding ``ColumnSpec.depends_on``) or be dropped is a
+        product decision, not a correctness fix.
+        """
         for t, cts in table_specs.items():
             df = dfs[t]
-            num_cols = [c.name for c in cts.columns if c.dtype in ("int", "float")]
+            num_cols = [c.name for c in cts.columns
+                        if c.dtype in ("int", "float") and c.name in df.columns]
+            if len(num_cols) < 2:
+                continue
+
+            matrix = df[num_cols].corr(numeric_only=True)
+            cols = list(matrix.columns)
+            if len(cols) < 2:
+                continue
+            # A constant column correlates with nothing and yields NaN; treat
+            # that as "no relationship" rather than letting it propagate.
+            values = np.nan_to_num(np.abs(matrix.to_numpy()), nan=0.0)
+
+            rows, cols_idx = np.triu_indices(len(cols), k=1)
+            strong = values[rows, cols_idx] > cls._DEPENDS_ON_R
+
             sugg: Dict[str, List[str]] = {}
-            for i, a in enumerate(num_cols):
-                for b in num_cols[i + 1:]:
-                    if a not in df.columns or b not in df.columns:
-                        continue
-                    try:
-                        r = df[[a, b]].dropna().corr().iloc[0, 1]
-                    except Exception:
-                        r = 0
-                    if r is not None and abs(float(r)) > 0.95:
-                        sugg.setdefault(a, []).append(b)
-                        sugg.setdefault(b, []).append(a)
+            for i, j in zip(rows[strong], cols_idx[strong]):
+                a, b = cols[int(i)], cols[int(j)]
+                sugg.setdefault(a, []).append(b)
+                sugg.setdefault(b, []).append(a)
+
             if sugg:
                 md = dict(cts.metadata or {})
                 md["suggested_depends_on"] = sugg
