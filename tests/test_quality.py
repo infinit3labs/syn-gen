@@ -15,6 +15,7 @@ import pytest
 
 from syntab.quality import (
     DEFAULT_SUBSAMPLE,
+    _as_numeric,
     boundary_adherence,
     category_adherence,
     category_coverage,
@@ -167,6 +168,32 @@ def test_tv_complement_matches_hand_computed_tvd():
     synth = pd.Series(["a"] * 70 + ["b"] * 30)
     # TVD = 0.5 * (|0.5-0.7| + |0.5-0.3|) = 0.2
     assert tv_complement(real, synth) == pytest.approx(0.8)
+
+
+def test_datetime_metrics_ignore_unparseable_values():
+    """NaT must not enter the metrics as a timestamp near the year 1677.
+
+    Found on the real CFPB source, whose date columns hold more than one
+    format. astype("int64") maps NaT to INT64_MIN rather than to something
+    dropna() removes, which put RangeCoverage at exactly 0.0 -- the real
+    range started at INT64_MIN, so nothing could cover it -- and KSComplement
+    at 0.6044, roughly the fraction of rows that happened to parse.
+    """
+    dates = pd.date_range("2020-01-01", periods=100, freq="D")
+    real = pd.Series([d.strftime("%Y-%m-%d") for d in dates] + ["not a date"] * 10)
+    synth = pd.Series([d.strftime("%Y-%m-%d") for d in dates] + ["not a date"] * 10)
+    assert ks_complement(real, synth) == pytest.approx(1.0)
+    assert range_coverage(real, synth) == pytest.approx(1.0)
+    assert boundary_adherence(real, synth) == pytest.approx(1.0)
+
+
+def test_mixed_date_formats_in_one_column_still_parse():
+    """The real CFPB source holds both 07/29/2017 and 09-09-2015."""
+    real = pd.Series(["07/29/2017", "09-09-2015", "01/02/2016", "03-04-2017"] * 25)
+    assert infer_kind(real) == "datetime"
+    parsed = _as_numeric(real)
+    assert parsed.notna().all(), "a minority date format was coerced to NaT"
+    assert ks_complement(real, real) == pytest.approx(1.0)
 
 
 def test_range_coverage_penalises_a_narrow_synthetic_range():

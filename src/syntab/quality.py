@@ -98,15 +98,47 @@ NUM_DISCRETE_BINS = 10
 # Primitives
 # ---------------------------------------------------------------------------
 
+def _parse_datetime(series: pd.Series) -> pd.Series:
+    """Parse to datetime, tolerating a column with more than one format.
+
+    ``format="mixed"`` infers per element. Without it a column holding both
+    ``07/29/2017`` and ``09-09-2015`` -- which the real CFPB source does --
+    silently coerces every value in the minority format to NaT.
+    """
+    try:
+        return pd.to_datetime(series, errors="coerce", format="mixed")
+    except (ValueError, TypeError):
+        return pd.to_datetime(series, errors="coerce")
+
+
+def _datetime_to_numeric(parsed: pd.Series) -> pd.Series:
+    """Datetime -> float nanoseconds, with NaT as NaN.
+
+    The obvious ``parsed.astype("int64")`` turns NaT into INT64_MIN rather
+    than into something ``dropna()`` will remove, so every unparseable date
+    silently enters the metrics as a timestamp near the year 1677. On the
+    real CFPB source that put KSComplement at 0.6044 and RangeCoverage at
+    exactly 0.0 for both date columns -- the range spanned from INT64_MIN, so
+    nothing could cover it. Float carries NaN, and its 53-bit mantissa is
+    ~256ns of resolution on a modern timestamp, which no distributional
+    metric here can notice.
+    """
+    return parsed.astype("int64").astype("float64").mask(parsed.isna())
+
+
 def _as_numeric(series: pd.Series) -> pd.Series:
-    """Coerce datetimes to int64 nanoseconds; leave other numerics alone."""
+    """Coerce datetimes to numeric nanoseconds; leave other numerics alone.
+
+    Returns a series with the SAME index, so callers can align two columns
+    and drop rows pairwise.
+    """
     if pd.api.types.is_datetime64_any_dtype(series.dtype):
-        return series.astype("int64")
+        return _datetime_to_numeric(series)
     if pd.api.types.is_numeric_dtype(series.dtype):
         return series
-    parsed = pd.to_datetime(series, errors="coerce")
+    parsed = _parse_datetime(series)
     if parsed.notna().any():
-        return parsed.astype("int64")
+        return _datetime_to_numeric(parsed)
     return pd.to_numeric(series, errors="coerce")
 
 
@@ -175,11 +207,7 @@ def infer_kind(series: pd.Series) -> str:
     if pd.api.types.is_datetime64_any_dtype(series.dtype):
         return "datetime"
     s = series.dropna().astype(str)
-    try:
-        parsed = pd.to_datetime(series, errors="coerce", format="mixed")
-    except (ValueError, TypeError):
-        parsed = pd.to_datetime(series, errors="coerce")
-    if parsed.notna().mean() > 0.8:
+    if _parse_datetime(series).notna().mean() > 0.8:
         return "datetime"
     n_unique = s.nunique()
     if n_unique / max(1, len(s)) < 0.5 and n_unique <= 50:

@@ -84,6 +84,19 @@ def test_tv_complement_matches_sdmetrics(frames):
             SDMTVComplement.compute(real[col], synth[col]), abs=DISCRETE_TOL)
 
 
+def test_datetime_metrics_match_sdmetrics():
+    """Datetime columns, where the NaT-to-INT64_MIN bug lived."""
+    dates = pd.date_range("2020-01-01", periods=500, freq="h")
+    real = pd.Series(dates)
+    synth = pd.Series(pd.date_range("2020-01-02", periods=500, freq="h"))
+    assert quality.ks_complement(real, synth) == pytest.approx(
+        SDMKSComplement.compute(real, synth), abs=EXACT_TOL)
+    assert quality.range_coverage(real, synth) == pytest.approx(
+        SDMRangeCoverage.compute(real, synth), abs=1e-6)
+    assert quality.boundary_adherence(real, synth) == pytest.approx(
+        SDMBoundaryAdherence.compute(real, synth), abs=EXACT_TOL)
+
+
 def test_range_coverage_matches_sdmetrics(frames):
     real, synth = frames
     for col in ("num", "num2"):
