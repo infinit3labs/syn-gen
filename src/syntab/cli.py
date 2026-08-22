@@ -21,6 +21,11 @@ from .profiler import (
     DEFAULT_MIN_CELL_COUNT,
     RECOMMENDED_MIN_CELL_COUNT,
 )
+from .discovery import (
+    DEFAULT_FD_ERROR,
+    DEFAULT_IND_ERROR,
+    DEFAULT_MIN_MU,
+)
 from .spec import Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings
 
 
@@ -185,10 +190,49 @@ def validate(spec_path: str) -> None:
 @click.option("--pii-strategy", "pii_strategy", default="faker",
               type=click.Choice(["faker", "mask", "redact", "hash"]),
               help="Anonymization strategy for --pii columns.")
+@click.option("--discover/--no-discover", "discover", default=None,
+              help="Discover keys and foreign keys with published algorithms "
+                   "(HyUCC for unique column combinations, SPIDER for "
+                   "inclusion dependencies) instead of column-name rules. "
+                   "Default: on when the optional 'discovery' extra is "
+                   "installed, off otherwise. --discover makes a missing "
+                   "install an error rather than a silent downgrade.")
+@click.option("--discover-fds", "discover_fds", is_flag=True,
+              help="Also discover functional dependencies (HyFD for exact "
+                   "ones, Pyro for approximate ones) and record them in the "
+                   "spec with their algorithm, error and strength. OFF by "
+                   "default: it is the expensive part of profiling and its "
+                   "output is a report for a human rather than an input to "
+                   "generation.")
+@click.option("--fd-error", "fd_error", default=DEFAULT_FD_ERROR, type=float,
+              show_default=True,
+              help="Error bound for approximate functional dependencies: the "
+                   "fraction of tuple pairs allowed to violate one (the g1 "
+                   "measure). 0 restricts the search to exact dependencies, "
+                   "which on real dirty data finds almost nothing.")
+@click.option("--fd-min-mu", "fd_min_mu", default=DEFAULT_MIN_MU, type=float,
+              show_default=True,
+              help="Minimum cardinality-corrected strength (mu-prime) for a "
+                   "reported dependency. Without it a near-key column appears "
+                   "to determine every other column in the table.")
+@click.option("--ind-error", "ind_error", default=DEFAULT_IND_ERROR, type=float,
+              show_default=True,
+              help="Error bound for inclusion dependencies. 0 requires a "
+                   "foreign key to hold exactly; raise it for an extract with "
+                   "a few orphaned rows.")
+@click.option("--merge-into", "merge_into", default=None,
+              help="Path to an existing spec to fold this profile into. "
+                   "Rules a human has edited since the spec was written are "
+                   "kept, detected by comparing each rule against a "
+                   "fingerprint of what the profiler last wrote. Without this "
+                   "a re-profile overwrites the file and every hand "
+                   "correction with it.")
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             max_categorical: int, max_categorical_ratio: float,
             min_cell_count: int, redact_categoricals: bool,
-            pii: str, pii_strategy: str) -> None:
+            pii: str, pii_strategy: str, discover, discover_fds: bool,
+            fd_error: float, fd_min_mu: float, ind_error: float,
+            merge_into: str) -> None:
     """Profile one or more datasets into a Spec.
 
     With a single dataset, produces a single-table Spec. With multiple
@@ -207,7 +251,9 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     opts = dict(max_categorical=max_categorical,
                 max_categorical_ratio=max_categorical_ratio,
                 redact_categoricals=redact_categoricals,
-                min_cell_count=min_cell_count)
+                min_cell_count=min_cell_count,
+                discover=discover, discover_fds=discover_fds,
+                fd_error=fd_error, fd_min_mu=fd_min_mu, ind_error=ind_error)
     if len(datasets) == 1:
         profiler = DatasetProfiler.from_file(
             datasets[0], name=name, sample=sample, seed=seed,
@@ -226,13 +272,41 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             dfs, name=name, sample=sample, seed=seed,
             pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
         )
+    if merge_into:
+        from .profiler import merge_preserving_edits
+        spec = merge_preserving_edits(from_file(merge_into), spec)
     to_file(spec, out)
     n_rel = sum(len(t.relationships) for t in spec.tables)
     n_pii = sum(1 for t in spec.tables for c in t.columns if c.pii)
+    n_fd = sum(len(t.metadata.get("discovery", {})
+                   .get("functional_dependencies", []))
+               for t in spec.tables)
+    n_kept = sum(
+        1 for t in spec.tables
+        for prov in [t.key_provenance] + [r.provenance for r in t.relationships]
+        if prov is not None and prov.human_edited
+    )
     click.echo(
         f"Profiled {len(datasets)} dataset(s) -> {out}: "
         f"{len(spec.tables)} table(s), {n_rel} relationship(s), {n_pii} PII column(s)"
     )
+    # Say which of the two paths produced the structure. A spec that says
+    # "SPIDER over 208,398 rows" and one that says "the column name ended in
+    # _id" warrant different amounts of review, and the difference should not
+    # require opening the file to see.
+    algorithms = sorted({
+        prov.algorithm.split("+")[0]
+        for t in spec.tables
+        for prov in [t.key_provenance] + [r.provenance for r in t.relationships]
+        if prov is not None
+    })
+    if algorithms:
+        click.echo(f"  structure inferred by: {', '.join(algorithms)}")
+    if n_fd:
+        click.echo(f"  {n_fd} functional dependenc"
+                   f"{'y' if n_fd == 1 else 'ies'} recorded")
+    if merge_into:
+        click.echo(f"  merged into {merge_into}: {n_kept} hand-edited rule(s) preserved")
     # The disclosure summary goes to stderr, deliberately. It is a notice about
     # the artefact rather than part of it, and stderr is the stream that
     # survives `syntab profile ... | tee`, redirection and CI log capture -- the
