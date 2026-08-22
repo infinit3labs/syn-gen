@@ -19,10 +19,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from . import discovery
 from .spec import (
     CategoricalProfile,
     ColumnProfile,
     ColumnSpec,
+    InferenceProvenance,
     NumericProfile,
     RelationshipSpec,
     Settings,
@@ -195,10 +197,63 @@ def _redact_categorical_values(values: Dict[str, float]) -> Dict[str, float]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Structure discovery
+# ---------------------------------------------------------------------------
+# Keys, foreign keys and column dependencies are discovered with the published
+# algorithms in ``syntab.discovery`` (HyFD, Pyro, HyUCC, SPIDER) rather than
+# inferred from column names. Discovery needs the optional ``[discovery]``
+# extra; when it is absent the profiler falls back to the name-based rules
+# that preceded it and says so in the provenance it records, so a spec always
+# states which of the two produced each rule.
+#
+# ``None`` means "use discovery if it is installed". Pass True to make its
+# absence an error, False to force the fallback.
+DEFAULT_DISCOVER = None
+
+# Widest candidate key the profiler will adopt as a primary key. A discovered
+# 5-column unique combination is real and is almost never the table's key.
+MAX_KEY_COLUMNS = 3
+
+# Cap on composite unique constraints written into a spec. Populating
+# ``unique_constraints`` turns off the engine's vectorized generation path
+# (see engine._is_vectorizable), so the profiler emits only genuinely
+# composite ones -- single-column uniqueness already travels as
+# ``constraints.unique``, which does not cost the fast path -- and only a
+# handful of them.
+MAX_COMPOSITE_UNIQUE_CONSTRAINTS = 3
+
+
 # Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
 DEFAULT_MAX_CATEGORICAL = 50
 DEFAULT_MAX_CATEGORICAL_RATIO = 0.05
 DEFAULT_MAX_CATEGORICAL_RATIO_CAP = 500
+
+
+class _NamedKey:
+    """Stand-in for a discovered UCC when discovery did not run.
+
+    Lets the primary-key selection run one code path whether the evidence came
+    from HyUCC or from the per-column uniqueness check that preceded it.
+    """
+
+    __slots__ = ("columns",)
+
+    def __init__(self, columns: Tuple[str, ...]):
+        self.columns = columns
+
+
+def _fingerprint(value: Any) -> str:
+    """Stable digest of a value the profiler wrote into a spec.
+
+    Recorded on the provenance so a later re-profile can tell its own previous
+    output from a human edit. See ``merge_preserving_edits``.
+    """
+    import hashlib
+    import json
+
+    payload = json.dumps(value, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _name_tokens(name: str) -> List[str]:
@@ -448,6 +503,12 @@ class DatasetProfiler:
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
+        discover: Optional[bool] = DEFAULT_DISCOVER,
+        fd_error: float = discovery.DEFAULT_FD_ERROR,
+        fd_min_mu: float = discovery.DEFAULT_MIN_MU,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+        discovery_sample_rows: int = discovery.DEFAULT_SAMPLE_ROWS,
+        discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
     ):
         self.full = df
         self.name = name or "profiled"
@@ -461,6 +522,16 @@ class DatasetProfiler:
         self.pii_strategy = pii_strategy
         self.redact_categoricals = redact_categoricals
         self.min_cell_count = max(0, int(min_cell_count))
+        if discover is True and not discovery.is_available():
+            discovery.require_desbordante()  # raises with an actionable message
+        self.discover = (
+            discovery.is_available() if discover is None else bool(discover)
+        )
+        self.fd_error = fd_error
+        self.fd_min_mu = fd_min_mu
+        self.ind_error = ind_error
+        self.discovery_sample_rows = discovery_sample_rows
+        self.discovery_max_lhs = discovery_max_lhs
         # id-like columns whose base name looks identifying (patient_id). Not
         # auto-flagged -- see pii_name_signal -- but surfaced for review.
         self.identifying_key_candidates: List[str] = []
@@ -574,7 +645,9 @@ class DatasetProfiler:
             spec = self._profile_column(str(c), sdf[c], full=df[c])
             if spec is not None:
                 cols.append(spec)
-        pk = self._detect_pk(cols)
+        uccs = self._discover_uccs(df)
+        pk, key_prov = self._detect_pk(cols, uccs, source_rows)
+        unique_constraints = self._composite_unique_constraints(uccs, pk)
         # ``row_count`` is the size of the SOURCE dataset, not of whatever
         # sample we happened to read. It is the contract "a dataset of this
         # shape has this many rows", and ``syntab check`` compares generated
@@ -588,7 +661,9 @@ class DatasetProfiler:
             name=name,
             row_count=source_rows,
             primary_key=pk,
+            key_provenance=key_prov,
             columns=cols,
+            unique_constraints=unique_constraints,
             metadata={
                 "profiling": {
                     "source_row_count": source_rows,
@@ -1149,24 +1224,148 @@ class DatasetProfiler:
         except Exception:
             return False
 
-    def _detect_pk(self, cols: List[ColumnSpec]) -> Optional[str]:
-        # A primary key is UNIQUE *and* NOT NULL. Only the first half was
-        # being checked, so a unique-but-nullable column could be nominated
-        # and would then fail the conformance checker's own PK check, because
-        # pandas' ``duplicated`` counts repeated NaNs as duplicates where SQL
-        # UNIQUE does not.
-        candidates = [
-            c for c in cols
-            if c.constraints.get("unique")
-            and not c.constraints.get("nullable", True)
-        ]
-        if not candidates:
+    def _discover_uccs(self, df: pd.DataFrame) -> Optional[List[Any]]:
+        """Unique column combinations of the source table, or None.
+
+        HyUCC (Papenbrock & Naumann, BTW 2017), via ``syntab.discovery``.
+        Returns None -- not an empty list -- when discovery is switched off or
+        unavailable, so the caller can tell "no keys" from "did not look".
+        """
+        if not self.discover:
             return None
-        for c in candidates:
-            if _is_id_like(c.name):
-                return c.name
-        # otherwise first unique integer/string column
-        for c in candidates:
-            if c.dtype in ("int", "str"):
-                return c.name
-        return candidates[0].name
+        try:
+            return discovery.discover_unique_column_combinations(
+                df,
+                max_columns=MAX_KEY_COLUMNS,
+                sample_rows=self.discovery_sample_rows,
+                seed=self.seed,
+            )
+        except discovery.DiscoveryUnavailable:
+            return None
+
+    def _composite_unique_constraints(
+        self, uccs: Optional[List[Any]], pk: Optional[Any]
+    ) -> List[List[str]]:
+        """Composite candidate keys, as spec-level unique constraints.
+
+        Only genuinely composite ones (2+ columns) and only a few: see
+        MAX_COMPOSITE_UNIQUE_CONSTRAINTS for why the cap exists. Single-column
+        uniqueness is already carried by ``constraints.unique`` on the column,
+        which is where the engine and the conformance checker read it from.
+        """
+        if not uccs:
+            return []
+        pk_cols = tuple(pk) if isinstance(pk, list) else (pk,) if pk else ()
+        out: List[List[str]] = []
+        for u in uccs:
+            if len(u.columns) < 2 or u.columns == pk_cols:
+                continue
+            out.append(list(u.columns))
+            if len(out) >= MAX_COMPOSITE_UNIQUE_CONSTRAINTS:
+                break
+        return out
+
+    def _detect_pk(
+        self,
+        cols: List[ColumnSpec],
+        uccs: Optional[List[Any]] = None,
+        source_rows: Optional[int] = None,
+    ) -> Tuple[Optional[Any], Optional[InferenceProvenance]]:
+        """Choose a primary key from discovered unique column combinations.
+
+        A primary key is UNIQUE *and* NOT NULL. Both halves are checked: a
+        unique-but-nullable column nominated as a key fails the conformance
+        checker's own PK check, because pandas' ``duplicated`` counts repeated
+        NaNs as duplicates where SQL UNIQUE does not.
+
+        The uniqueness evidence is HyUCC's, over the whole table, not a naming
+        convention. THE COLUMN NAME IS A TIE-BREAKER AND NOTHING ELSE: it is
+        consulted only when more than one discovered candidate key survives
+        the NOT NULL filter, which is the one situation where the data cannot
+        distinguish them -- ``paid`` and ``record_id`` are both unique in
+        ``{paid, record_id, region}`` and only the name says which is the key.
+        When a single candidate survives, the name is never read, and the
+        recorded provenance says which of the two decided.
+
+        Composite keys: adopted only when no single-column candidate exists.
+        A one-column key is what downstream generation is built around, and a
+        table that has both is a table whose single-column key is the key.
+        Among several composites the narrowest wins, ties broken
+        lexicographically -- an arbitrary rule, chosen for determinism, and
+        the reason the losers are still recorded as unique constraints.
+
+        Falls back to the pre-existing per-column uniqueness check when
+        discovery is unavailable, recording ``algorithm="name-heuristic"`` so
+        the spec does not overstate its evidence.
+        """
+        by_name = {c.name: c for c in cols}
+
+        def usable(name: str) -> bool:
+            c = by_name.get(name)
+            return bool(c and not c.constraints.get("nullable", True))
+
+        discovered = uccs is not None
+        if discovered:
+            singles = [u for u in uccs
+                       if len(u.columns) == 1 and usable(u.columns[0])]
+            composites = [u for u in uccs
+                          if 2 <= len(u.columns) <= MAX_KEY_COLUMNS
+                          and all(usable(c) for c in u.columns)]
+        else:
+            # Pre-discovery behaviour: each column judged on its own.
+            singles = [
+                _NamedKey((c.name,)) for c in cols
+                if c.constraints.get("unique")
+                and not c.constraints.get("nullable", True)
+            ]
+            composites = []
+
+        algorithm = "HyUCC" if discovered else "name-heuristic"
+        support = source_rows
+
+        if not singles:
+            if composites:
+                chosen = min(composites, key=lambda u: (len(u.columns), u.columns))
+                return list(chosen.columns), InferenceProvenance(
+                    algorithm=algorithm,
+                    citation=discovery.CITATIONS.get(algorithm),
+                    measure="exact", confidence=1.0, support=support,
+                    validated_on="full",
+                    fingerprint=_fingerprint(list(chosen.columns)),
+                )
+            return None, None
+
+        names = [u.columns[0] for u in singles]
+        if len(names) == 1:
+            chosen, tie_broken_by = names[0], None
+        else:
+            chosen, tie_broken_by = self._break_key_tie(names, by_name)
+
+        return chosen, InferenceProvenance(
+            algorithm=algorithm if tie_broken_by is None
+            else f"{algorithm}+{tie_broken_by}-tiebreak",
+            citation=discovery.CITATIONS.get(algorithm),
+            measure="exact", confidence=1.0, support=support,
+            validated_on="full",
+            fingerprint=_fingerprint(chosen),
+        )
+
+    @staticmethod
+    def _break_key_tie(
+        names: List[str], by_name: Dict[str, ColumnSpec]
+    ) -> Tuple[str, str]:
+        """Pick between several equally-unique candidate keys.
+
+        Ordered weakest-evidence-last: an identifier-shaped name first, then a
+        key-shaped dtype, then declaration order. All three are conventions
+        rather than facts about the data -- which is precisely why they run
+        only after the data has failed to decide.
+        """
+        for n in names:
+            if _is_id_like(n):
+                return n, "name"
+        for n in names:
+            c = by_name.get(n)
+            if c is not None and c.dtype in ("int", "str"):
+                return n, "dtype"
+        return names[0], "order"
