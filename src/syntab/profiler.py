@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import datetime as _dt
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import re
 
 from .spec import (
     CategoricalProfile,
@@ -31,7 +31,7 @@ from .spec import (
     TableSpec,
 )
 
-_UUID_RE = __import__("re").compile(
+_UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
