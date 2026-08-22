@@ -106,6 +106,37 @@ def test_faithful_synthetic_scores_high_on_every_property():
         assert p.score > 0.85, f"{p.name}={p.score}\n{report.to_text(verbose=True)}"
 
 
+def test_key_columns_are_excluded_from_the_graded_properties():
+    """A surrogate key has no distribution or relationships worth scoring.
+
+    Including one adds noise in both directions: a synthetic key range that
+    legitimately does not overlap the real one drags Column Shapes down, and
+    pairing the key against every other column pulls Column Pair Trends
+    toward the middle. SDMetrics excludes the `id` sdtype for the same
+    reason; key integrity is KeyUniqueness's job in the diagnostic report.
+    """
+    real = _correlated(seed=21)
+    real.insert(0, "id", range(len(real)))
+    synth = _correlated(seed=22)
+    synth.insert(0, "id", range(10_000, 10_000 + len(synth)))
+
+    spec = Spec(
+        metadata=SpecMetadata(name="t"),
+        tables=[TableSpec(name="t", row_count=len(real), primary_key="id",
+                          columns=[ColumnSpec(name="id", dtype="int",
+                                              generator="sequence")])],
+    )
+    report = quality_report(real, synth, spec=spec)
+    assert report.excluded_key_columns == ["id"]
+    scored = {r.column for p in report.properties for r in p.results}
+    assert "id" not in scored
+    assert not any("id" in c for c in scored if "|" in c)
+    assert "Key columns excluded" in report.to_text()
+
+    # Without a spec there is nothing declaring it a key, so it is scored.
+    assert quality_report(real, synth).excluded_key_columns == []
+
+
 def test_pair_trends_property_is_actually_populated():
     """Guard against the property silently computing nothing."""
     real = _correlated(seed=3)
@@ -162,6 +193,26 @@ def test_category_adherence_catches_an_invented_category():
     real = pd.Series(["x", "y"] * 10)
     synth = pd.Series(["x", "y", "x", "INVENTED"])
     assert category_adherence(real, synth) == pytest.approx(0.75)
+
+
+def test_category_adherence_does_not_punish_faithful_nulls():
+    """A null is a value the source produces, when the source produces nulls.
+
+    Found on the real CFPB data: `Tags` is 82.9% null and was scoring 0.1714
+    -- exactly its non-null fraction -- because the real value set was built
+    with dropna() and so could never contain NaN. The column was being
+    reported as structurally broken while it faithfully reproduced the source.
+    """
+    real = pd.Series(["x", "y", None, None] * 10)
+    synth = pd.Series(["x", "y", None, None] * 10)
+    assert category_adherence(real, synth) == pytest.approx(1.0)
+
+
+def test_category_adherence_still_punishes_nulls_the_source_never_has():
+    """The other half: NULL into a never-null column IS an invented value."""
+    real = pd.Series(["x", "y"] * 10)
+    synth = pd.Series(["x", "y", None, None])
+    assert category_adherence(real, synth) == pytest.approx(0.5)
 
 
 def test_missing_value_similarity_compares_null_rates():

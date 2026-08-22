@@ -112,6 +112,24 @@ def test_category_adherence_matches_sdmetrics(frames):
             SDMCategoryAdherence.compute(real[col], synth[col]), abs=EXACT_TOL)
 
 
+@pytest.mark.parametrize("real_values,synth_values", [
+    (["a", "b", "a", "b"], ["a", "b", "a", "ZZ"]),          # invented category
+    (["a", "b", None, None], ["a", "b", None, None]),        # nulls both sides
+    (["a", "b", "a", "b"], ["a", "b", None, None]),          # nulls only synth
+    (["a", "b", None, "b"], ["a", "ZZ", None, None]),        # both at once
+])
+def test_category_adherence_null_handling_matches_sdmetrics(real_values, synth_values):
+    """The null cases specifically.
+
+    The first parametrization is the only one the original fixture covered,
+    which is how a null-handling divergence got past this file once already.
+    """
+    real = pd.Series(real_values)
+    synth = pd.Series(synth_values)
+    assert quality.category_adherence(real, synth) == pytest.approx(
+        SDMCategoryAdherence.compute(real, synth), abs=EXACT_TOL)
+
+
 def test_missing_value_similarity_matches_sdmetrics():
     real = pd.Series([1.0, 2.0, None, None, 5.0])
     synth = pd.Series([1.0, None, 3.0, 4.0, 5.0])

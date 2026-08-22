@@ -253,10 +253,19 @@ def category_adherence(real: pd.Series, synthetic: pd.Series) -> float:
     one: it asks whether the generator invented a category that never occurs
     in the source. An invented category is broken output, not merely
     imprecise output, which is why it belongs in the diagnostic report.
+
+    Null handling matters here and is easy to get wrong. A null is adherent
+    when the real column also has nulls, and a violation when it does not --
+    a generator emitting NULL into a column that is never null in the source
+    HAS invented a value. ``Series.isin(Series)`` gives exactly that
+    behaviour, because pandas matches NaN against NaN, which is why the real
+    column is passed through whole rather than as a set of its non-null
+    values. Dropping the nulls first scores a column that is 83% null at
+    0.17 while it is faithfully reproducing that column.
     """
     if len(synthetic) == 0:
         return float("nan")
-    return float(synthetic.isin(set(real.dropna().unique())).mean())
+    return float(synthetic.isin(real).mean())
 
 
 def missing_value_similarity(real: pd.Series, synthetic: pd.Series) -> float:
@@ -450,6 +459,9 @@ class QualityReport:
     properties: List[Property] = field(default_factory=list)
     real_rows: int = 0
     synthetic_rows: int = 0
+    #: Key columns held out of the graded properties. Reported rather than
+    #: dropped silently, so the exclusion is visible in the output.
+    excluded_key_columns: List[str] = field(default_factory=list)
 
     @property
     def overall_score(self) -> float:
@@ -470,6 +482,7 @@ class QualityReport:
             "overall_score": None if math.isnan(self.overall_score) else round(self.overall_score, 4),
             "overall_score_all_properties": None if math.isnan(both) else round(both, 4),
             "scored_properties": [p.name for p in self.properties if p.contributes],
+            "excluded_key_columns": list(self.excluded_key_columns),
             "real_rows": self.real_rows,
             "synthetic_rows": self.synthetic_rows,
             "properties": [
@@ -515,6 +528,10 @@ class QualityReport:
             "    property that detects destroyed relationships. "
             f"Five-way mean: {_fmt(self.overall_score_all_properties).strip()}",
         ]
+        if self.excluded_key_columns:
+            lines.append(
+                "    Key columns excluded (checked by KeyUniqueness in "
+                f"`syntab diagnose`): {', '.join(self.excluded_key_columns)}")
         if verbose:
             for p in self.properties:
                 lines += ["", f"  {p.name} -- {p.description}",
@@ -739,6 +756,18 @@ def quality_report(
     and the character-distribution metrics; ``None`` disables subsampling.
     """
     cols = _shared_columns(real, synthetic)
+    # Key columns are excluded from every graded property, matching SDMetrics'
+    # treatment of the `id` sdtype -- it appears in none of its property
+    # metric maps. A surrogate key has no distribution worth reproducing and
+    # no meaningful relationship with any other column, so scoring it adds
+    # noise in both directions: a synthetic key range that legitimately does
+    # not overlap the real one drags Column Shapes down, while ~50 pairings
+    # of a key against everything else pull Column Pair Trends toward the
+    # middle. Key integrity is checked by KeyUniqueness in the diagnostic
+    # report, which is the right question to ask of a key.
+    key_members = {c for key in _key_columns(spec, table, cols) for c in key}
+    excluded_keys = sorted(key_members)
+    cols = [c for c in cols if c not in key_members]
     kinds = _resolve_kinds(real, cols, spec, table)
 
     shapes = Property(
@@ -816,6 +845,7 @@ def quality_report(
         properties=[p for p in properties if p.results],
         real_rows=len(real),
         synthetic_rows=len(synthetic),
+        excluded_key_columns=excluded_keys,
     )
 
 
