@@ -18,7 +18,25 @@ dependencies = [
 
 [project.optional-dependencies]
 parquet = ["pyarrow"]
-dev = ["pytest", "pyarrow"]
+# Principled dependency discovery (functional dependencies, unique column
+# combinations, inclusion dependencies). Kept OPTIONAL and deliberately out of
+# the core dependency list for two reasons:
+#
+#   1. LICENSE. Desbordante is AGPL-3.0-only. syntab itself declares no
+#      license yet; making an AGPL library a hard runtime dependency is a
+#      decision with distribution consequences (the network-use clause in
+#      particular) that belongs to whoever owns this package, not to the
+#      profiler. As an extra, the user installs it themselves and the
+#      obligation attaches to their deployment, not to a syntab wheel.
+#   2. PLATFORM. It is a compiled C++ extension. Wheels are published for
+#      Linux (manylinux_2_28 x86_64/aarch64) and macOS only -- there is no
+#      Windows wheel -- and the wheel is ~13 MB unpacked (a 12 MB extension
+#      plus 1.2 MB of bundled Boost shared objects).
+#
+# Everything in syntab works without it; ``syntab.discovery`` degrades to a
+# clear error and the profiler falls back to its pre-existing heuristics.
+discovery = ["desbordante>=2.4,<3"]
+dev = ["pytest", "pyarrow", "desbordante>=2.4,<3"]
 
 [project.scripts]
 syntab = "syntab.cli:cli"
