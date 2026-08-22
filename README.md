@@ -23,6 +23,8 @@ compatible dataset. The profiler round-trip uses `generator: auto` + embedded
 ```bash
 pip install -e .
 pip install -e ".[parquet,dev]"   # optional parquet + dev deps
+pip install -e ".[discovery]"     # key / foreign-key / dependency discovery
+                                  # (AGPL-3.0-only, Linux + macOS wheels only)
 ```
 
 ## Library
@@ -127,15 +129,35 @@ violations, and any cross-join rule that references the broken key cascades
 into a failure on the child table as well.
 
 ## Profiling multiple tables
-`syntab profile` accepts **one or more** datasets. With several, it infers
-foreign-key relationships: a column `<parent>_id` is linked to the table whose
-name matches `<parent>` (or its plural) and whose primary-key values are a
-superset of the column's values. Strong numeric correlations are recorded as
-`metadata.suggested_depends_on` hints (non-breaking).
+`syntab profile` accepts **one or more** datasets. With several, it discovers
+foreign-key relationships from *inclusion dependencies* (SPIDER), not from
+column names:
 
 ```bash
+pip install "syntab[discovery]"
 syntab profile users.csv orders.csv --out spec.yaml
 ```
+
+On the real CFPB extract, normalized into the star schema its own values
+describe, the previous name-based rule (`<parent>_id` matching a table name)
+finds **0** of the 6 foreign keys that are there, because no CFPB column is
+named after a table. SPIDER finds all 6 in about four seconds.
+
+Keys come from discovered unique column combinations (HyUCC) rather than from
+names; the name is only a tie-breaker between candidates the data cannot
+separate. Functional dependencies (HyFD for exact ones, Pyro for approximate
+ones) are available with `--discover-fds`.
+
+Every inferred rule records which algorithm produced it, over how many rows,
+and how strong the evidence was -- and `--merge-into` lets you re-profile
+without losing hand edits.
+
+**Desbordante, which provides the algorithms, is AGPL-3.0-only and ships no
+Windows wheel**, which is why it is an optional extra. Profiling works without
+it, falling back to the name-based rules and saying so in the spec.
+
+See **[docs/discovery.md](docs/discovery.md)** for the algorithms, the
+measures, the cost and the guards.
 
 ## PII / anonymization
 A profiled dataset can contain personally identifiable information. syntab

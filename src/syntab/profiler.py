@@ -228,9 +228,10 @@ MAX_COMPOSITE_UNIQUE_CONSTRAINTS = 3
 # module -- on the 208k-row CFPB source it is the difference between a 3.3 s
 # and a 20.7 s profile -- and unlike key and foreign-key discovery its output
 # does not currently steer generation (see the commit that removed
-# ``suggested_depends_on`` for exactly why it cannot yet). Paying forty seconds
-# by default for a report nothing consumes would be the wrong trade; paying it
-# on request, to understand a dataset before editing its spec, is a good one.
+# ``suggested_depends_on`` for exactly why it cannot yet). Paying six times the
+# profiling cost by default for a report nothing consumes would be the wrong
+# trade; paying it on request, to understand a dataset before editing its spec,
+# is a good one.
 DEFAULT_DISCOVER_FDS = False
 
 # Cap on functional dependencies recorded in a spec, strongest first. A wide
