@@ -82,6 +82,13 @@ class ColumnSpec(BaseModel):
     # anonymization strategy applied at generation time:
     # faker | mask | redact | hash  (None -> no special handling)
     pii_strategy: Optional[str] = None
+    # Which detection signal(s) flagged this column, in the profiler's
+    # vocabulary: "explicit" (named in --pii), "column-name", "value-pattern".
+    # Recorded because they warrant different follow-up -- a value-pattern hit
+    # is evidence about the data, a column-name hit is an inference from a
+    # label that may be wrong in either direction. None when not profiled or
+    # not flagged, so it is omitted from a serialized spec entirely.
+    pii_detected_by: Optional[List[str]] = None
     description: Optional[str] = None
     profile: Optional[ColumnProfile] = None
 
