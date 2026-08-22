@@ -256,6 +256,40 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _table_name_forms(table: str) -> set:
+    """The base names a foreign-key column could carry for ``table``.
+
+    ``users`` is referenced by ``user_id`` as often as by ``users_id``, so the
+    singular and plural are both accepted. Used only to break a tie between
+    equally well-covered candidate parents.
+    """
+    low = table.lower()
+    forms = {low, low + "s"}
+    if low.endswith("s"):
+        forms.add(low[:-1])
+    return forms
+
+
+def _would_cycle(edges: set, child: str, parent: str) -> bool:
+    """Whether adding child -> parent closes a cycle in the table graph.
+
+    The engine generates a parent table before its children and raises on a
+    cyclic spec, so a pair of tables whose keys happen to contain each other
+    must not both become foreign keys.
+    """
+    seen = {parent}
+    stack = [parent]
+    while stack:
+        node = stack.pop()
+        if node == child:
+            return True
+        for a, b in edges:
+            if a == node and b not in seen:
+                seen.add(b)
+                stack.append(b)
+    return False
+
+
 def _name_tokens(name: str) -> List[str]:
     return _NAME_TOKEN_RE.findall(name or "")
 
@@ -695,13 +729,20 @@ class DatasetProfiler:
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
+        discover: Optional[bool] = DEFAULT_DISCOVER,
+        fd_error: float = discovery.DEFAULT_FD_ERROR,
+        fd_min_mu: float = discovery.DEFAULT_MIN_MU,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+        discovery_sample_rows: int = discovery.DEFAULT_SAMPLE_ROWS,
+        discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
     ) -> Spec:
-        """Profile several related tables and infer foreign-key relationships.
+        """Profile several related tables and discover foreign keys.
 
-        Relationship inference matches a column ``<parent>_id`` to a table whose
-        name matches ``<parent>`` (or its plural) and whose primary-key values
-        are a superset of the column's values. Strong numeric correlations are
-        recorded as ``metadata.suggested_depends_on`` hints (non-breaking).
+        Foreign keys come from inclusion dependencies found by SPIDER
+        (Bauckmann, Leser, Naumann & Tietz, ICDE 2007), not from column names.
+        See ``_relationships_from_inds`` for how an IND becomes a foreign key,
+        and ``_relationships_from_names`` for the name-based rule that is now
+        only the fallback for when the optional discovery extra is absent.
         """
         profilers = {
             t: cls(df, name=t, sample=sample, seed=seed,
@@ -710,14 +751,23 @@ class DatasetProfiler:
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
                    pii_columns=pii_columns, pii_strategy=pii_strategy,
                    redact_categoricals=redact_categoricals,
-                   min_cell_count=min_cell_count)
+                   min_cell_count=min_cell_count,
+                   discover=discover, fd_error=fd_error, fd_min_mu=fd_min_mu,
+                   ind_error=ind_error,
+                   discovery_sample_rows=discovery_sample_rows,
+                   discovery_max_lhs=discovery_max_lhs)
             for t, df in tables.items()
         }
         table_specs = {
             t: profilers[t]._build_table_spec(df, t, f"profiled:{t}")
             for t, df in tables.items()
         }
-        rels = cls._infer_relationships(table_specs, tables)
+        any_profiler = next(iter(profilers.values()), None)
+        use_discovery = bool(any_profiler and any_profiler.discover)
+        rels = cls._infer_relationships(
+            table_specs, tables,
+            use_discovery=use_discovery, ind_error=ind_error,
+        )
         for t, rel_list in rels.items():
             table_specs[t].relationships = rel_list
         cls._infer_depends_on(table_specs, tables)
@@ -741,14 +791,12 @@ class DatasetProfiler:
         Two columns are only candidates for a key relationship if they hold
         the same kind of value. Note that ``is_numeric_dtype`` is true of a
         boolean column, so bool has to be tested first.
+
+        Delegates to ``discovery.value_kind``: the same rule now also has to
+        gate what is handed to SPIDER and what is believed of its output, and
+        two copies of a type-compatibility rule drift.
         """
-        if pd.api.types.is_bool_dtype(s):
-            return "bool"
-        if pd.api.types.is_numeric_dtype(s):
-            return "numeric"
-        if pd.api.types.is_datetime64_any_dtype(s):
-            return "datetime"
-        return "string"
+        return discovery.value_kind(s)
 
     @classmethod
     def _key_values(cls, s: pd.Series) -> set:
@@ -785,10 +833,249 @@ class DatasetProfiler:
             return set(pd.to_datetime(s).tolist())
         return set(s.astype(str).tolist())
 
+    # ----- foreign keys -----------------------------------------------
+    #
+    # A foreign key is an inclusion dependency whose referenced side is a key.
+    # That is the definition, and it is also the primary discriminating
+    # feature in the published work on picking foreign keys out of a set of
+    # INDs (Rostin, Albrecht, Bauckmann, Naumann & Leser, "A Machine Learning
+    # Approach to Foreign Key Discovery", WebDB 2009). SPIDER supplies the
+    # INDs; the rules below decide which of them are foreign keys.
+
     @classmethod
     def _infer_relationships(
+        cls,
+        table_specs: Dict[str, "TableSpec"],
+        dfs: Dict[str, pd.DataFrame],
+        *,
+        use_discovery: bool = True,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+    ) -> Dict[str, List[RelationshipSpec]]:
+        """Foreign keys, from inclusion dependencies where possible.
+
+        Falls back to the name-based rule when the discovery extra is absent,
+        recording ``algorithm="name-heuristic"`` on the provenance so a spec
+        never overstates the evidence behind a relationship.
+        """
+        if use_discovery and discovery.is_available():
+            try:
+                return cls._relationships_from_inds(
+                    table_specs, dfs, ind_error=ind_error
+                )
+            except discovery.DiscoveryUnavailable:
+                pass
+        return cls._relationships_from_names(table_specs, dfs)
+
+    @staticmethod
+    def _normalize_key_column(s: pd.Series) -> pd.Series:
+        """Put a column into the form key comparison happens in.
+
+        Integral numerics are narrowed to a nullable integer so a nullable
+        foreign key -- which pandas holds as float64, making 1 into "1.0" --
+        compares equal to an int64 parent key of "1". This is the same
+        normalization ``_key_values`` performs for the name-based path, moved
+        upstream of SPIDER because SPIDER compares the values itself.
+
+        2**53 is the largest integer float64 represents exactly; past it the
+        float is already lossy, so narrowing would invent precision.
+        """
+        kind = discovery.value_kind(s)
+        if kind != "numeric":
+            return s
+        vals = pd.to_numeric(s, errors="coerce").astype("Float64")
+        nn = vals.dropna()
+        if len(nn) and bool((nn % 1 == 0).all()) and float(nn.abs().max()) < 2 ** 53:
+            return vals.astype("Int64")
+        return vals
+
+    @classmethod
+    def _ind_candidate_columns(
+        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
+    ) -> Dict[str, List[str]]:
+        """Which columns are worth handing to SPIDER.
+
+        The promotion rule below only ever accepts an IND whose PARENT side is
+        a table's primary key, so the referenced side of the search space is
+        exactly the set of primary-key columns. A column is therefore a useful
+        candidate only if it is a primary key, or if some other table's
+        primary key could contain it. Two necessary conditions decide that:
+
+          * same value kind -- the type-compatibility pruning introduced by
+            the P0 work, kept because it is sound and cheap;
+          * no more distinct values than the parent key has. Containment
+            cannot hold otherwise, so this discards nothing real.
+
+        On the CFPB source the second condition is what keeps the 202,516
+        distinct free-text narratives out of a sort-merge over every column.
+        This is a pre-filter on the candidate set. Recall now comes from
+        SPIDER, not from a rule about column names.
+        """
+        keys: Dict[str, Tuple[str, str, int]] = {}
+        for name, ts in table_specs.items():
+            pk = ts.primary_key
+            if not isinstance(pk, str) or pk not in dfs[name].columns:
+                continue
+            col = dfs[name][pk]
+            keys[name] = (pk, discovery.value_kind(col), int(col.nunique(dropna=True)))
+
+        out: Dict[str, List[str]] = {}
+        for name, df in dfs.items():
+            own_pk = keys.get(name, (None,))[0]
+            chosen: List[str] = []
+            for c in df.columns:
+                c = str(c)
+                if c == own_pk:
+                    chosen.append(c)
+                    continue
+                kind = discovery.value_kind(df[c])
+                distinct = int(df[c].nunique(dropna=True))
+                if distinct == 0:
+                    continue
+                if any(pk_kind == kind and distinct <= pk_distinct
+                       for other, (_, pk_kind, pk_distinct) in keys.items()
+                       if other != name):
+                    chosen.append(c)
+            if chosen:
+                out[name] = chosen
+        return out
+
+    @classmethod
+    def _relationships_from_inds(
+        cls,
+        table_specs: Dict[str, "TableSpec"],
+        dfs: Dict[str, pd.DataFrame],
+        *,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+    ) -> Dict[str, List[RelationshipSpec]]:
+        """Promote SPIDER's inclusion dependencies to foreign keys.
+
+        An IND ``child.c SUBSET-OF parent.p`` becomes a foreign key when:
+
+        1. ``p`` IS the parent table's primary key. This is what a foreign key
+           means, and it is the feature that does nearly all the work: on the
+           CFPB source it is what rejects the reverse INDs (a dimension's
+           values are trivially contained in the fact column they came from)
+           and the accidental ones between two unconstrained fact columns.
+        2. ``c`` is NOT the child table's own primary key. A mutual inclusion
+           between two primary keys is a one-to-one correspondence with no
+           direction the data can settle, and asserting one at random is worse
+           than asserting none. This deliberately declines some real 1:1
+           foreign keys; see the report.
+        3. the two columns have the same value kind. SPIDER compares values
+           after its own conversion, so the string "1" is contained in an
+           integer column of 1s. The type-compatibility rule from the P0 work
+           rejects that, here as a post-filter as well as a pre-filter.
+        4. the tables differ. An intra-table IND into the table's own key is a
+           self-reference, which the engine supports but only with the extra
+           settings (nullable key, root_fraction, max_depth) that make a
+           hierarchy terminate. Inferring one without them produces a spec
+           that fails validation, so it is left to a human. Called out in the
+           report rather than inferred.
+
+        When a child column is contained in several primary keys, the one with
+        the highest COVERAGE -- distinct child values over distinct parent key
+        values -- wins. Coverage is one of the features Rostin et al. (WebDB
+        2009) rank foreign-key candidates on: a child column that uses almost
+        all of a key is far more likely to reference it than one that touches
+        a handful of a much larger key's values. Column NAME breaks a
+        remaining tie and nothing more, exactly as it does for primary keys.
+
+        Finally, edges that would make the inter-table graph cyclic are
+        dropped lowest-coverage-first: the engine generates parents before
+        children and cannot satisfy a cycle.
+        """
+        frames = {t: df for t, df in dfs.items() if len(df) > 0}
+        columns = cls._ind_candidate_columns(table_specs, frames)
+        normalized = {
+            t: pd.DataFrame(
+                {c: cls._normalize_key_column(frames[t][c]) for c in cols}
+            )
+            for t, cols in columns.items()
+        }
+        if not normalized:
+            return {t: [] for t in table_specs}
+
+        inds = discovery.discover_inclusion_dependencies(
+            normalized, error=ind_error
+        )
+
+        pk_of = {
+            name: ts.primary_key if isinstance(ts.primary_key, str) else None
+            for name, ts in table_specs.items()
+        }
+        scored: List[Tuple[float, bool, Any]] = []
+        for ind in inds:
+            if ind.child_table == ind.parent_table:
+                continue                                        # rule 4
+            if pk_of.get(ind.parent_table) != ind.parent_column:  # rule 1
+                continue
+            if pk_of.get(ind.child_table) == ind.child_column:    # rule 2
+                continue
+            child_raw = dfs[ind.child_table][ind.child_column]
+            parent_raw = dfs[ind.parent_table][ind.parent_column]
+            if discovery.value_kind(child_raw) != discovery.value_kind(parent_raw):
+                continue                                        # rule 3
+            parent_distinct = int(parent_raw.nunique(dropna=True))
+            if parent_distinct == 0:
+                continue
+            coverage = int(child_raw.nunique(dropna=True)) / parent_distinct
+            name_match = _id_base(ind.child_column) in _table_name_forms(
+                ind.parent_table
+            )
+            scored.append((coverage, name_match, ind))
+
+        # Best parent per child column: coverage, then the name, then a stable
+        # alphabetical order so the result does not depend on dict ordering.
+        best: Dict[Tuple[str, str], Tuple[float, bool, Any]] = {}
+        for coverage, name_match, ind in scored:
+            key = (ind.child_table, ind.child_column)
+            current = best.get(key)
+            candidate = (coverage, name_match, ind)
+            if current is None or (
+                (coverage, name_match, ind.parent_table)
+                > (current[0], current[1], current[2].parent_table)
+            ):
+                best[key] = candidate
+
+        rels: Dict[str, List[RelationshipSpec]] = {t: [] for t in table_specs}
+        edges: set = set()
+        for coverage, name_match, ind in sorted(
+            best.values(), key=lambda x: (-x[0], x[2].child_table, x[2].child_column)
+        ):
+            if _would_cycle(edges, ind.child_table, ind.parent_table):
+                continue
+            edges.add((ind.child_table, ind.parent_table))
+            rels[ind.child_table].append(RelationshipSpec(**{
+                "from": ind.child_column,
+                "to": f"{ind.parent_table}.{ind.parent_column}",
+                "alias": ind.parent_table,
+                "provenance": InferenceProvenance(
+                    algorithm="SPIDER" if not name_match else "SPIDER+name-tiebreak",
+                    citation=discovery.CITATIONS["SPIDER"],
+                    measure="exact" if ind.error == 0.0 else "ind_error",
+                    confidence=round(1.0 - ind.error, 6),
+                    error=round(ind.error, 6),
+                    support=ind.support,
+                    validated_on="full",
+                    fingerprint=_fingerprint(
+                        [ind.child_column,
+                         f"{ind.parent_table}.{ind.parent_column}"]
+                    ),
+                ),
+            }))
+        return rels
+
+    @classmethod
+    def _relationships_from_names(
         cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
     ) -> Dict[str, List[RelationshipSpec]]:
+        """The pre-discovery rule: ``<parent>_id`` plus a table-stem match.
+
+        Kept as the fallback for installations without the optional discovery
+        extra. Its recall is bounded by a naming convention -- on the CFPB
+        source no column is named ``<table>_id``, so it finds nothing at all --
+        which is the whole reason SPIDER is now the primary path.
+        """
         rels: Dict[str, List[RelationshipSpec]] = {t: [] for t in table_specs}
         names = set(table_specs)
         for cname, cts in table_specs.items():
@@ -823,9 +1110,20 @@ class DatasetProfiler:
                     if cls._value_kind(parent) != child_kind:
                         continue
                     if child_vals.issubset(cls._key_values(parent)):
-                        rels[cname].append(RelationshipSpec(
-                            **{"from": colname, "to": f"{pname}.{pkp}", "alias": pname}
-                        ))
+                        rels[cname].append(RelationshipSpec(**{
+                            "from": colname,
+                            "to": f"{pname}.{pkp}",
+                            "alias": pname,
+                            "provenance": InferenceProvenance(
+                                algorithm="name-heuristic",
+                                measure="name-match",
+                                support=int(len(cdf)),
+                                validated_on="full",
+                                fingerprint=_fingerprint(
+                                    [colname, f"{pname}.{pkp}"]
+                                ),
+                            ),
+                        }))
                         break
         return rels
 
@@ -1335,7 +1633,13 @@ class DatasetProfiler:
                 )
             return None, None
 
-        names = [u.columns[0] for u in singles]
+        # Ordered by the columns declaration order, not by the order the
+        # discovery algorithm happened to emit its results in, so that the
+        # last-resort "first candidate wins" tie-break is deterministic and
+        # means what it says.
+        position = {c.name: i for i, c in enumerate(cols)}
+        names = sorted((u.columns[0] for u in singles),
+                       key=lambda n: position.get(n, len(position)))
         if len(names) == 1:
             chosen, tie_broken_by = names[0], None
         else:
