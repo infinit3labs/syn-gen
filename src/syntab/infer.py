@@ -6,9 +6,10 @@ re-synthesized compatibly.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from .spec import ColumnProfile, ColumnSpec
+from .generators import empirical_text_params
+from .spec import ColumnProfile, ColumnSpec, Spec
 
 
 def resolve_generator(col: ColumnSpec) -> Tuple[Optional[str], dict]:
@@ -117,3 +118,50 @@ def resolve_generator(col: ColumnSpec) -> Tuple[Optional[str], dict]:
         "uuid": "uuid",
     }.get(col.dtype, "string")
     return default, params
+
+
+def fit_text_params(spec: Spec, frames: Dict[str, Any]) -> Spec:
+    """Fill free-text columns' generator params from the source data.
+
+    A stopgap, and deliberately opt-in. ``ColumnProfile`` records a text
+    column's length as a ``(min, max)`` pair and nothing about its characters,
+    so a profiled spec on its own cannot tell the string generator what the
+    source text looked like. Until the profiler records those statistics, this
+    walks a spec against the frames it was profiled from and fills in the
+    length and character distributions with
+    :func:`syntab.generators.empirical_text_params`.
+
+    Only columns that actually resolve to the ``string`` generator are
+    touched, and only params that are not already set -- an explicit value in
+    the spec always wins.
+
+    ``frames`` maps table name -> anything indexable by column name yielding
+    an iterable of values (a DataFrame, or a dict of lists).
+
+    Returns a deep copy; the input spec is not modified.
+
+    DISCLOSURE NOTE
+    ---------------
+    This writes source-derived statistics into the spec, in the same way that
+    profiling a categorical column writes its real values and frequencies --
+    see ``docs/disclosure.md``. A character-frequency vector over a corpus is
+    weak evidence about any single record, but a length distribution over a
+    small group is not nothing. Treat the resulting spec as derived from the
+    source data, and review it before sharing it.
+    """
+    out = spec.model_copy(deep=True)
+    for table in out.tables:
+        frame = frames.get(table.name)
+        if frame is None:
+            continue
+        for col in table.columns:
+            gen, _ = resolve_generator(col)
+            if gen != "string":
+                continue
+            try:
+                values = frame[col.name]
+            except (KeyError, TypeError, IndexError):
+                continue
+            for key, value in empirical_text_params(values).items():
+                col.params.setdefault(key, value)
+    return out

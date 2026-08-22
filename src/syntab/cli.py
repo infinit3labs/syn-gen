@@ -11,6 +11,7 @@ import pandas as pd
 
 from . import formats
 from . import generators
+from . import quality
 from .disclosure import DisclosureReport
 from .engine import GenerationEngine, SpecError
 from .loaders import from_file, spec_to_dict, to_file
@@ -290,7 +291,13 @@ def _read_tables(path: str) -> Dict[str, pd.DataFrame]:
 @click.option("--spec", "spec_path", default=None, help="Optional Spec for column types.")
 @click.option("--out", "out", default=None, help="Write the JSON report to this path.")
 def compare(real_path: str, synth_path: str, spec_path: str, out: str) -> None:
-    """Compare real vs synthetic data column distributions."""
+    """Compare real vs synthetic per-column distributions (pass/warn/fail).
+
+    MARGINALS ONLY. This compares each column against its counterpart in
+    isolation and says nothing about the relationships between columns, so a
+    dataset can pass here with every correlation in it destroyed. Use
+    `syntab quality` for a graded score that includes column pair trends.
+    """
     from .validator import validate
 
     real = _read_any(real_path)
@@ -304,12 +311,108 @@ def compare(real_path: str, synth_path: str, spec_path: str, out: str) -> None:
     sys.exit(0 if report.overall_pass else 1)
 
 
+@cli.command(name="quality")
+@click.option("--real", "real_path", required=True, help="Path to the real dataset.")
+@click.option("--synthetic", "synth_path", required=True, help="Path to the synthetic dataset.")
+@click.option("--spec", "spec_path", default=None,
+              help="Optional Spec. Used for column types and key columns, "
+                   "which are more reliable than inferring them from the data.")
+@click.option("--out", "out", default=None, help="Write the JSON report to this path.")
+@click.option("--verbose", is_flag=True, help="Show the per-column breakdown.")
+@click.option("--min-score", "min_score", default=None, type=float,
+              help="Exit non-zero if the overall score falls below this. For "
+                   "CI. Left unset, this command always exits 0 -- a quality "
+                   "score is a measurement, not a verdict.")
+@click.option("--sample", default=None, type=int,
+              help="Rows to sample for the quadratic pair-trend pass and the "
+                   f"character-distribution metrics (default {quality.DEFAULT_SUBSAMPLE}). "
+                   "0 disables sampling.")
+@click.option("--no-pair-trends", "no_pair_trends", is_flag=True,
+              help="Skip Column Pair Trends. Note that this removes the only "
+                   "property that detects destroyed relationships between "
+                   "columns, which is the failure mode a rule-based generator "
+                   "is most exposed to.")
+def quality_cmd(real_path: str, synth_path: str, spec_path: str, out: str,
+                verbose: bool, min_score: float, sample: int,
+                no_pair_trends: bool) -> None:
+    """Score synthetic fidelity against real data (graded, 0..1).
+
+    One of THREE reports, which answer different questions:
+
+      syntab quality   -- how closely does the synthetic data RESEMBLE the
+                          real data? Graded. Column shapes, column pair
+                          trends, coverage, boundary adherence, missingness.
+      syntab diagnose  -- is the synthetic data structurally VALID? Pass/fail.
+      syntab check     -- does the data honour its SPEC? Pass/fail, and needs
+                          no real data to run.
+
+    Fidelity is a matter of degree, so this one reports a score rather than a
+    verdict. Use --min-score to turn it into a gate.
+    """
+    real = _read_any(real_path)
+    synth = _read_any(synth_path)
+    spec = from_file(spec_path) if spec_path else None
+    eff_sample = quality.DEFAULT_SUBSAMPLE if sample is None else (sample or None)
+    report = quality.quality_report(
+        real, synth, spec=spec, sample=eff_sample,
+        pair_trends=not no_pair_trends,
+    )
+    click.echo(report.to_text(verbose=verbose))
+    if out:
+        Path(out).write_text(json.dumps(report.to_dict(), indent=2, default=str),
+                             encoding="utf-8")
+        click.echo(f"Report written to {out}")
+    if min_score is not None and report.overall_score < min_score:
+        click.echo(f"Overall score {report.overall_score:.4f} is below "
+                   f"--min-score {min_score}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--real", "real_path", required=True, help="Path to the real dataset.")
+@click.option("--synthetic", "synth_path", required=True, help="Path to the synthetic dataset.")
+@click.option("--spec", "spec_path", default=None,
+              help="Optional Spec. Supplies column types and the key columns "
+                   "checked for uniqueness.")
+@click.option("--out", "out", default=None, help="Write the JSON report to this path.")
+@click.option("--verbose", is_flag=True, help="Show every check, not just failures.")
+@click.option("--tolerance", default=0.0, type=float, show_default=True,
+              help="How far below 1.0 a diagnostic metric may fall and still "
+                   "pass. The default is strict on purpose: these checks are "
+                   "for things that are broken, not things that are imprecise.")
+def diagnose(real_path: str, synth_path: str, spec_path: str, out: str,
+             verbose: bool, tolerance: float) -> None:
+    """Check that synthetic data is structurally valid (pass/fail).
+
+    Data Structure (do the columns match?) and Data Validity (is every value
+    one the source could have produced -- in range, a real category, a unique
+    key?). These catch output that is broken rather than merely low-fidelity;
+    `syntab quality` scores the fidelity.
+    """
+    real = _read_any(real_path)
+    synth = _read_any(synth_path)
+    spec = from_file(spec_path) if spec_path else None
+    report = quality.diagnostic_report(real, synth, spec=spec, tolerance=tolerance)
+    click.echo(report.to_text(verbose=verbose))
+    if out:
+        Path(out).write_text(json.dumps(report.to_dict(), indent=2, default=str),
+                             encoding="utf-8")
+        click.echo(f"Report written to {out}")
+    sys.exit(0 if report.overall_ok else 1)
+
+
 @cli.command()
 @click.option("--spec", "spec_path", required=True, help="Path to the Spec YAML/JSON.")
 @click.option("--data", "data", required=True,
               help="Generated dataset: a directory or file of table(s) (csv/parquet/json/jsonl).")
 def check(spec_path: str, data: str) -> None:
-    """Certify that generated data conforms to its Spec (PK, FK, rules, ...)."""
+    """Certify that generated data conforms to its Spec (PK, FK, rules, ...).
+
+    The third of the three reports, and the only one that needs no real data:
+    it checks the output against the contract it was generated from rather
+    than against a source dataset. `syntab quality` and `syntab diagnose`
+    answer the other two questions.
+    """
     from .conformance import validate_against_spec
 
     spec = from_file(spec_path)

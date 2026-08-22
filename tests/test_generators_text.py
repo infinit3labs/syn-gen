@@ -20,7 +20,7 @@ from faker import Faker
 from syntab.engine import GenerationEngine
 from syntab.generators import GenContext, empirical_text_params
 from syntab.generators import BUILTINS
-from syntab.infer import resolve_generator
+from syntab.infer import fit_text_params, resolve_generator
 from syntab.profiler import DatasetProfiler
 from syntab.validator import validate
 
@@ -173,3 +173,61 @@ def test_profiled_free_text_no_longer_generates_at_a_single_length():
     assert synth_len.min() >= real_len.min()
     # Mean length is in the right neighbourhood rather than pinned to the max.
     assert abs(synth_len.mean() - real_len.mean()) / real_len.mean() < 0.15
+
+
+# ---------------------------------------------------------------------------
+# fit_text_params: the stopgap that reaches the character distribution
+# ---------------------------------------------------------------------------
+
+def test_fit_text_params_fills_in_the_character_distribution():
+    real = pd.DataFrame({"narrative": _prose()})
+    spec = DatasetProfiler(real, name="t", sample=None, seed=1).profile()
+    fitted = fit_text_params(spec, {"t": real})
+
+    params = fitted.tables[0].columns[0].params
+    assert " " in params["char_values"]
+    assert params["length_edges"] or params["length_values"]
+
+
+def test_fit_text_params_does_not_mutate_the_input_spec():
+    real = pd.DataFrame({"narrative": _prose()})
+    spec = DatasetProfiler(real, name="t", sample=None, seed=1).profile()
+    fit_text_params(spec, {"t": real})
+    assert "char_values" not in spec.tables[0].columns[0].params
+
+
+def test_fit_text_params_respects_values_already_in_the_spec():
+    real = pd.DataFrame({"narrative": _prose()})
+    spec = DatasetProfiler(real, name="t", sample=None, seed=1).profile()
+    spec.tables[0].columns[0].params["char_values"] = ["z"]
+    spec.tables[0].columns[0].params["char_weights"] = [1.0]
+    fitted = fit_text_params(spec, {"t": real})
+    assert fitted.tables[0].columns[0].params["char_values"] == ["z"]
+
+
+def test_fit_text_params_leaves_non_string_columns_alone():
+    real = pd.DataFrame({"n": np.arange(500.0), "narrative": _prose(500)})
+    spec = DatasetProfiler(real, name="t", sample=None, seed=1).profile()
+    fitted = fit_text_params(spec, {"t": real})
+    numeric = next(c for c in fitted.tables[0].columns if c.name == "n")
+    assert "char_values" not in numeric.params
+
+
+def test_fit_text_params_tolerates_a_missing_table_or_column():
+    real = pd.DataFrame({"narrative": _prose(300)})
+    spec = DatasetProfiler(real, name="t", sample=None, seed=1).profile()
+    assert fit_text_params(spec, {}) is not spec           # no table
+    assert fit_text_params(spec, {"t": pd.DataFrame({"other": [1]})})  # no column
+
+
+def test_fitted_spec_generates_text_the_validator_accepts():
+    """End to end: profile -> fit -> generate -> validate, on free text."""
+    real = pd.DataFrame({"narrative": _prose()})
+    spec = DatasetProfiler(real, name="t", sample=None, seed=1).profile()
+    fitted = fit_text_params(spec, {"t": real})
+    synth = GenerationEngine(fitted).run().to_frames()["t"]
+
+    report = validate(real, synth)
+    col = next(c for c in report.columns if c.name == "narrative")
+    assert col.status == "pass", report.to_text()
+    assert col.details["char_tvd"] < 0.1

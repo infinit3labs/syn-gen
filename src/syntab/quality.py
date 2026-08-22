@@ -408,11 +408,16 @@ class MetricResult:
 
 @dataclass
 class Property:
-    """A named group of metrics, scored as the mean of its members."""
+    """A named group of metrics, scored as the mean of its members.
+
+    ``contributes`` marks whether the property feeds the headline Quality
+    Score. See :class:`QualityReport` for why three of the five do not.
+    """
 
     name: str
     description: str
     results: List[MetricResult] = field(default_factory=list)
+    contributes: bool = True
 
     @property
     def score(self) -> float:
@@ -423,9 +428,23 @@ class Property:
 class QualityReport:
     """Graded fidelity report. Scores, never a verdict.
 
-    ``overall_score`` is the unweighted mean of the property scores, matching
-    the SDMetrics aggregation. Properties that could not be computed at all
-    (no applicable columns) are skipped rather than counted as zero.
+    ``overall_score`` is the unweighted mean of **Column Shapes** and
+    **Column Pair Trends**, which is exactly what SDMetrics' Quality Score
+    aggregates -- those are the only two properties in its QualityReport.
+
+    Coverage, Boundary Adherence and Missing Value Similarity are reported
+    alongside them, graded, but do not feed the headline number. That is a
+    deliberate choice and not an oversight. Averaging all five dilutes the
+    one property that detects the failure this report exists to catch: on a
+    dataset whose columns were independently shuffled -- identical marginals,
+    every relationship destroyed -- the other four properties are all exactly
+    1.0 by construction, so a five-way mean scores it 0.90 and buries the
+    defect. Over the two SDMetrics properties the same dataset scores ~0.75,
+    which is a number that reads like the problem it is.
+
+    ``overall_score_all_properties`` exposes the five-way mean for anyone who
+    wants it. Properties with no applicable columns are skipped rather than
+    counted as zero.
     """
 
     properties: List[Property] = field(default_factory=list)
@@ -434,20 +453,30 @@ class QualityReport:
 
     @property
     def overall_score(self) -> float:
+        """SDMetrics' Quality Score: mean of Column Shapes and Pair Trends."""
+        return _mean(p.score for p in self.properties if p.contributes)
+
+    @property
+    def overall_score_all_properties(self) -> float:
+        """Unweighted mean across every property, dilution included."""
         return _mean(p.score for p in self.properties)
 
     def get_property(self, name: str) -> Optional[Property]:
         return next((p for p in self.properties if p.name == name), None)
 
     def to_dict(self) -> Dict[str, Any]:
+        both = self.overall_score_all_properties
         return {
             "overall_score": None if math.isnan(self.overall_score) else round(self.overall_score, 4),
+            "overall_score_all_properties": None if math.isnan(both) else round(both, 4),
+            "scored_properties": [p.name for p in self.properties if p.contributes],
             "real_rows": self.real_rows,
             "synthetic_rows": self.synthetic_rows,
             "properties": [
                 {
                     "name": p.name,
                     "description": p.description,
+                    "contributes_to_score": p.contributes,
                     "score": None if math.isnan(p.score) else round(p.score, 4),
                     "results": [
                         {"column": r.column, "metric": r.metric,
@@ -461,18 +490,31 @@ class QualityReport:
         }
 
     def to_text(self, verbose: bool = False) -> str:
+        scored = [p.name for p in self.properties if p.contributes]
         lines = [
             "QUALITY REPORT (graded fidelity -- scores, not a verdict)",
             f"  real={self.real_rows} rows  synthetic={self.synthetic_rows} rows",
             "",
             f"  Overall Score: {_fmt(self.overall_score)}",
+            f"    = mean of {' + '.join(scored)}",
             "",
-            f"  {'Property':<26}{'Score':>8}  Metrics",
+            f"  {'Property':<26}{'Score':>8}     Metrics",
             "  " + "-" * 68,
         ]
         for p in self.properties:
             metrics = sorted({r.metric for r in p.results})
-            lines.append(f"  {p.name:<26}{_fmt(p.score):>8}  {', '.join(metrics) or '--'}")
+            mark = "  * " if p.contributes else "    "
+            lines.append(
+                f"  {p.name:<26}{_fmt(p.score):>8}{mark}{', '.join(metrics) or '--'}")
+        lines += [
+            "  " + "-" * 68,
+            "  * counts toward the Overall Score (SDMetrics' two Quality "
+            "Score properties).",
+            "    The rest are graded and reported, but averaging all five "
+            "dilutes the one",
+            "    property that detects destroyed relationships. "
+            f"Five-way mean: {_fmt(self.overall_score_all_properties).strip()}",
+        ]
         if verbose:
             for p in self.properties:
                 lines += ["", f"  {p.name} -- {p.description}",
@@ -702,15 +744,20 @@ def quality_report(
     shapes = Property(
         "Column Shapes",
         "Per-column marginal distributions (KSComplement / TVComplement).")
+    # These three are graded and reported but do not feed the headline score
+    # -- see QualityReport for why.
     coverage = Property(
         "Coverage",
-        "Does the synthetic data span the real data's range and categories?")
+        "Does the synthetic data span the real data's range and categories?",
+        contributes=False)
     boundary = Property(
         "Boundary Adherence",
-        "Fraction of synthetic values inside the real [min, max].")
+        "Fraction of synthetic values inside the real [min, max].",
+        contributes=False)
     missing = Property(
         "Missing Value Similarity",
-        "Is the real null rate reproduced?")
+        "Is the real null rate reproduced?",
+        contributes=False)
 
     for c in cols:
         kind = kinds[c]

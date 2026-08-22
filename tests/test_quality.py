@@ -368,11 +368,39 @@ def test_diagnostic_report_serializes_and_renders():
     assert report.to_text(verbose=True)
 
 
-def test_overall_score_is_the_mean_of_property_scores():
+def test_overall_score_is_the_mean_of_the_two_sdmetrics_properties():
+    """The headline score is SDMetrics' Quality Score, not a five-way mean.
+
+    Averaging all five properties dilutes the only one that detects destroyed
+    relationships -- see test_five_way_mean_would_bury_destroyed_relationships.
+    """
     real = _correlated(seed=8)
     report = quality_report(real, _correlated(seed=9))
-    expected = np.mean([p.score for p in report.properties])
-    assert report.overall_score == pytest.approx(expected)
+    scored = [p for p in report.properties if p.contributes]
+    assert {p.name for p in scored} == {"Column Shapes", "Column Pair Trends"}
+    assert report.overall_score == pytest.approx(np.mean([p.score for p in scored]))
+    assert report.overall_score_all_properties == pytest.approx(
+        np.mean([p.score for p in report.properties]))
+
+
+def test_five_way_mean_would_bury_destroyed_relationships():
+    """Why the headline score is not the mean of all five properties.
+
+    Independently shuffling every column leaves Coverage, Boundary Adherence
+    and Missing Value Similarity at exactly 1.0 by construction -- a
+    permutation of a column has the same range, categories and null rate. Only
+    Column Pair Trends moves. Averaging all five therefore reports a dataset
+    with every relationship destroyed as a respectable score.
+    """
+    real = _correlated(seed=12)
+    report = quality_report(real, _shuffle_independently(real))
+
+    for name in ("Coverage", "Boundary Adherence", "Missing Value Similarity"):
+        assert report.get_property(name).score == pytest.approx(1.0)
+
+    assert report.overall_score_all_properties > 0.85   # the diluted number
+    assert report.overall_score < 0.8                   # the honest one
+    assert report.overall_score < report.overall_score_all_properties - 0.1
 
 
 def test_infer_kind_classifies_the_five_kinds():
