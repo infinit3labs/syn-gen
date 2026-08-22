@@ -79,6 +79,37 @@ _NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # Trailing tokens that mark a column as an identifier.
 _ID_TOKENS = {"id", "uuid", "guid"}
 
+# Placeholder token for a redacted categorical value. Zero-padded so the tokens
+# sort in the same (descending-frequency) order the profiler emits them in.
+_REDACTED_VALUE_PREFIX = "value_"
+
+
+def _redact_categorical_values(values: Dict[str, float]) -> Dict[str, float]:
+    """Replace real categorical labels with opaque tokens, keeping the shape.
+
+    Cardinality and the frequency vector are preserved exactly -- those are
+    what the generation engine consumes (``infer.resolve_generator`` turns them
+    into ``choice`` values + weights) -- while the labels themselves stop being
+    derived from the source data. Ordering is the profiler's descending-
+    frequency order, so ``value_001`` is always the modal category.
+
+    PLACEHOLDERS RATHER THAN HASHES, deliberately. A hash of a low-cardinality
+    categorical is not a de-identification measure: the domain is small and
+    usually guessable, so an unsalted digest is recovered by hashing the
+    candidate list and matching -- the failure demonstrated at scale on the
+    2014 NYC taxi release, where MD5-hashed medallion numbers were recovered
+    by brute force over the known medallion format. A keyed hash would fix
+    that, but it would also require key management this tool has no business
+    inventing, and it buys nothing here: nothing downstream needs to join on
+    these labels. An opaque counter is strictly safer and strictly simpler.
+    """
+    width = max(3, len(str(len(values))))
+    return {
+        f"{_REDACTED_VALUE_PREFIX}{i:0{width}d}": freq
+        for i, freq in enumerate(values.values(), start=1)
+    }
+
+
 # Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
 DEFAULT_MAX_CATEGORICAL = 50
 DEFAULT_MAX_CATEGORICAL_RATIO = 0.05
@@ -330,6 +361,7 @@ class DatasetProfiler:
         max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
+        redact_categoricals: bool = False,
     ):
         self.full = df
         self.name = name or "profiled"
@@ -341,6 +373,7 @@ class DatasetProfiler:
         self.max_categorical_ratio_cap = max_categorical_ratio_cap
         self.pii_columns = set(pii_columns or [])
         self.pii_strategy = pii_strategy
+        self.redact_categoricals = redact_categoricals
         # id-like columns whose base name looks identifying (patient_id). Not
         # auto-flagged -- see pii_name_signal -- but surfaced for review.
         self.identifying_key_candidates: List[str] = []
@@ -488,6 +521,7 @@ class DatasetProfiler:
         max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
+        redact_categoricals: bool = False,
     ) -> Spec:
         """Profile several related tables and infer foreign-key relationships.
 
@@ -501,7 +535,8 @@ class DatasetProfiler:
                    max_categorical=max_categorical,
                    max_categorical_ratio=max_categorical_ratio,
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
-                   pii_columns=pii_columns, pii_strategy=pii_strategy)
+                   pii_columns=pii_columns, pii_strategy=pii_strategy,
+                   redact_categoricals=redact_categoricals)
             for t, df in tables.items()
         }
         table_specs = {
@@ -827,15 +862,8 @@ class DatasetProfiler:
         # categorical vs free text
         n_unique = int(vals.nunique())
         if self._is_categorical(n_unique, len(vals)):
-            counts = vals.value_counts()
-            # _is_categorical already bounds n_unique; head() is a belt-and-
-            # braces guard so a future caller cannot make the profiler write an
-            # unbounded number of real values into a spec file.
-            chosen = counts.head(self._categorical_value_cap)
-            total = float(chosen.sum())
-            values = {str(k): round(float(v) / total, 4) for k, v in chosen.items()}
             return "str", ColumnProfile(
-                categorical=CategoricalProfile(values=values, null_rate=0.0)
+                categorical=self._categorical_profile(vals)
             )
 
         # free text: length stats (+ pattern if short)
@@ -844,6 +872,29 @@ class DatasetProfiler:
         if lengths.max() <= 30:
             prof.string_pattern = _string_pattern(vals.head(50).tolist())
         return "str", prof
+
+    def _categorical_profile(self, vals: pd.Series) -> CategoricalProfile:
+        """Build the categorical profile for a column, applying disclosure controls.
+
+        This is the single place where real source values are copied into a
+        spec, so it is the single place the disclosure controls have to act.
+        """
+        counts = vals.value_counts()
+        # _is_categorical already bounds n_unique; head() is a belt-and-braces
+        # guard so a future caller cannot make the profiler write an unbounded
+        # number of real values into a spec file.
+        chosen = counts.head(self._categorical_value_cap)
+        total = float(chosen.sum())
+        values = {str(k): round(float(v) / total, 4) for k, v in chosen.items()}
+
+        redacted = False
+        if self.redact_categoricals:
+            values = _redact_categorical_values(values)
+            redacted = True
+
+        return CategoricalProfile(
+            values=values, null_rate=0.0, redacted=redacted,
+        )
 
     @property
     def _categorical_value_cap(self) -> int:

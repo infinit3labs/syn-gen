@@ -49,6 +49,12 @@ class NumericProfile(BaseModel):
 class CategoricalProfile(BaseModel):
     values: Dict[str, float] = Field(default_factory=dict)  # value -> frequency
     null_rate: float = 0.0
+    # True when ``values`` holds placeholder tokens rather than real source
+    # values (profiled with --redact-categoricals). The frequency vector and
+    # the cardinality are still real -- that is what generation needs -- but
+    # the value labels carry no information from the source data. Recorded so
+    # a reader of the spec, and `syntab compare`, can tell the difference.
+    redacted: bool = False
 
 
 class ColumnProfile(BaseModel):

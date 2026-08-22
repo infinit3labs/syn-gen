@@ -156,6 +156,14 @@ def validate(spec_path: str) -> None:
                    f"{DEFAULT_MAX_CATEGORICAL_RATIO_CAP} distinct values). "
                    "Catches genuine categoricals that exceed "
                    "--max-categorical in absolute terms.")
+@click.option("--redact-categoricals", "redact_categoricals", is_flag=True,
+              help="Replace categorical values in the written spec with "
+                   "opaque placeholder tokens (value_001, value_002, ...). "
+                   "Cardinality and the frequency vector are preserved, so "
+                   "generation still works; the value labels stop being "
+                   "derived from the source data. Use when the spec will be "
+                   "committed or shared and the category labels themselves "
+                   "are sensitive.")
 @click.option("--pii", "pii", default=None,
               help="Comma-separated column names to treat as PII.")
 @click.option("--pii-strategy", "pii_strategy", default="faker",
@@ -163,7 +171,7 @@ def validate(spec_path: str) -> None:
               help="Anonymization strategy for --pii columns.")
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             max_categorical: int, max_categorical_ratio: float,
-            pii: str, pii_strategy: str) -> None:
+            redact_categoricals: bool, pii: str, pii_strategy: str) -> None:
     """Profile one or more datasets into a Spec.
 
     With a single dataset, produces a single-table Spec. With multiple
@@ -178,12 +186,14 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     from .profiler import DatasetProfiler
 
     pii_cols = [c.strip() for c in (pii or "").split(",") if c.strip()] or None
-    thresholds = dict(max_categorical=max_categorical,
-                      max_categorical_ratio=max_categorical_ratio)
+    # profiler options threaded through every construction path below
+    opts = dict(max_categorical=max_categorical,
+                max_categorical_ratio=max_categorical_ratio,
+                redact_categoricals=redact_categoricals)
     if len(datasets) == 1:
         profiler = DatasetProfiler.from_file(
             datasets[0], name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy, **thresholds,
+            pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
         )
         spec = profiler.profile()
     else:
@@ -191,12 +201,12 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         for d in datasets:
             profiler = DatasetProfiler.from_file(
                 d, sample=sample, seed=seed, pii_columns=pii_cols,
-                pii_strategy=pii_strategy, **thresholds,
+                pii_strategy=pii_strategy, **opts,
             )
             dfs[profiler.name] = profiler.full
         spec = DatasetProfiler.profile_set(
             dfs, name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy, **thresholds,
+            pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
         )
     to_file(spec, out)
     n_rel = sum(len(t.relationships) for t in spec.tables)
