@@ -79,6 +79,91 @@ _NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # Trailing tokens that mark a column as an identifier.
 _ID_TOKENS = {"id", "uuid", "guid"}
 
+# ---------------------------------------------------------------------------
+# Minimum cell-size suppression
+# ---------------------------------------------------------------------------
+# The standard statistical-disclosure-control response to rare categorical
+# values. The framing is k-anonymity (Samarati & Sweeney 1998; Sweeney 2002,
+# "k-Anonymity: A Model for Protecting Privacy"): a record is safe to release
+# only if it is indistinguishable from at least k-1 others on the quasi-
+# identifiers. A category with one member fails that immediately -- the
+# category *is* the identifier -- and a profiled spec publishes exactly the
+# distinct values and exact frequencies that make it visible.
+#
+# The two standard responses are SUPPRESSION (remove the cell) and
+# GENERALIZATION (coarsen it until the cell is big enough). This implements
+# generalization: values below the threshold are collapsed into a single
+# residual "other" category, which is the conventional move because it keeps
+# the total mass intact -- suppression alone would silently change the
+# frequency vector the generator reproduces.
+#
+# Worth saying plainly, because the opposite is widely assumed: synthetic data
+# is not automatically anonymous. A generator that faithfully reproduces a
+# category with two members reproduces the fact that those two people exist and
+# what distinguishes them; the ICO's 2025 anonymisation guidance and the
+# NIST/UK-ONS work on synthetic data both treat synthetic output as requiring
+# its own disclosure assessment rather than as de-identified by construction.
+# Fidelity and disclosure risk trade against each other. This is a control on
+# that trade, not a proof of anything.
+
+# Suppression is OFF by default. See DatasetProfiler._categorical_profile for
+# why, and note that the disclosure summary reports how many values fall below
+# RECOMMENDED_MIN_CELL_COUNT whether or not suppression is enabled.
+DEFAULT_MIN_CELL_COUNT = 0
+
+# The threshold to reach for when you do enable it, and the one the disclosure
+# summary measures against. Five is the most widely used minimum cell size in
+# published SDC practice -- it is the common floor in national statistical
+# office rules and in health-data release policy (CMS uses a stricter 11 for
+# Medicare claims, some agencies use 3). There is no principled universal
+# value: K is a policy decision about acceptable risk, and this constant is a
+# default for that decision, not a substitute for it.
+RECOMMENDED_MIN_CELL_COUNT = 5
+
+# Label for the residual bucket. Deliberately not a plausible real value, so
+# nobody mistakes it for one when reading a spec.
+OTHER_BUCKET_LABEL = "__other__"
+
+
+def _suppress_small_cells(
+    freqs: Dict[str, float],
+    source_counts: "pd.Series",
+    k: int,
+) -> Tuple[Dict[str, float], int]:
+    """Generalize categories with a source count below ``k`` into one bucket.
+
+    Returns ``(values, n_suppressed)``.
+
+    Includes SECONDARY (complementary) suppression: if the residual bucket is
+    itself smaller than k, it discloses its own members just as badly as the
+    cells it absorbed -- a bucket of one is the value it hid. The standard fix
+    is to keep absorbing, smallest surviving category first, until the bucket
+    clears the threshold. Without this step a single rare value simply gets
+    renamed to "__other__" and nothing is protected.
+    """
+    kept: Dict[str, float] = {}
+    rolled: Dict[str, float] = {}
+    for label, freq in freqs.items():
+        if int(source_counts.get(label, 0)) < k:
+            rolled[label] = freq
+        else:
+            kept[label] = freq
+
+    if not rolled:
+        return freqs, 0
+
+    bucket = sum(int(source_counts.get(l, 0)) for l in rolled)
+    for label in sorted(kept, key=lambda l: int(source_counts.get(l, 0))):
+        if bucket >= k:
+            break
+        rolled[label] = kept.pop(label)
+        bucket += int(source_counts.get(label, 0))
+
+    out = dict(kept)
+    out[OTHER_BUCKET_LABEL] = sum(rolled.values())
+    return out, len(rolled)
+
+
 # Placeholder token for a redacted categorical value. Zero-padded so the tokens
 # sort in the same (descending-frequency) order the profiler emits them in.
 _REDACTED_VALUE_PREFIX = "value_"
@@ -362,6 +447,7 @@ class DatasetProfiler:
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
+        min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
     ):
         self.full = df
         self.name = name or "profiled"
@@ -374,6 +460,7 @@ class DatasetProfiler:
         self.pii_columns = set(pii_columns or [])
         self.pii_strategy = pii_strategy
         self.redact_categoricals = redact_categoricals
+        self.min_cell_count = max(0, int(min_cell_count))
         # id-like columns whose base name looks identifying (patient_id). Not
         # auto-flagged -- see pii_name_signal -- but surfaced for review.
         self.identifying_key_candidates: List[str] = []
@@ -522,6 +609,7 @@ class DatasetProfiler:
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
+        min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
     ) -> Spec:
         """Profile several related tables and infer foreign-key relationships.
 
@@ -536,7 +624,8 @@ class DatasetProfiler:
                    max_categorical_ratio=max_categorical_ratio,
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
                    pii_columns=pii_columns, pii_strategy=pii_strategy,
-                   redact_categoricals=redact_categoricals)
+                   redact_categoricals=redact_categoricals,
+                   min_cell_count=min_cell_count)
             for t, df in tables.items()
         }
         table_specs = {
@@ -756,7 +845,7 @@ class DatasetProfiler:
         n_nulls = int(stats_src.isna().sum())
         null_rate = round(n_nulls / total, 4) if total else 1.0
 
-        dtype, profile = self._infer_type_and_profile(s)
+        dtype, profile = self._infer_type_and_profile(s, full=full)
         params: dict = {}
         constraints: dict = {"nullable": n_nulls > 0, "null_rate": null_rate}
 
@@ -831,7 +920,9 @@ class DatasetProfiler:
 
         return spec
 
-    def _infer_type_and_profile(self, s: pd.Series) -> Tuple[str, Optional[ColumnProfile]]:
+    def _infer_type_and_profile(
+        self, s: pd.Series, full: Optional[pd.Series] = None,
+    ) -> Tuple[str, Optional[ColumnProfile]]:
         if pd.api.types.is_bool_dtype(s.dtype):
             return "bool", None
 
@@ -862,8 +953,12 @@ class DatasetProfiler:
         # categorical vs free text
         n_unique = int(vals.nunique())
         if self._is_categorical(n_unique, len(vals)):
+            # Cell counts come from the FULL column, never the sample -- see
+            # _categorical_profile.
+            full_vals = (full.dropna().astype(str)
+                         if full is not None else None)
             return "str", ColumnProfile(
-                categorical=self._categorical_profile(vals)
+                categorical=self._categorical_profile(vals, full_vals)
             )
 
         # free text: length stats (+ pattern if short)
@@ -873,11 +968,33 @@ class DatasetProfiler:
             prof.string_pattern = _string_pattern(vals.head(50).tolist())
         return "str", prof
 
-    def _categorical_profile(self, vals: pd.Series) -> CategoricalProfile:
+    def _categorical_profile(
+        self, vals: pd.Series, full_vals: Optional[pd.Series] = None,
+    ) -> CategoricalProfile:
         """Build the categorical profile for a column, applying disclosure controls.
 
         This is the single place where real source values are copied into a
         spec, so it is the single place the disclosure controls have to act.
+        Order matters: suppression works on real labels, so it must run before
+        redaction destroys them.
+
+        CELL COUNTS COME FROM THE FULL COLUMN. "How many people share this
+        value" is a fact about the source data, and a sample cannot answer it:
+        a value seen 3 times in a 5,000-row sample of 4M rows is not rare, and
+        a value seen once might be one of thousands. Deciding suppression on
+        sample counts would be the same mistake as deciding uniqueness on them
+        (fixed in d3f78eb). Frequencies themselves are still sample-derived --
+        that is existing behaviour and out of scope here -- so the emitted
+        vector is unchanged when suppression is off.
+
+        SUPPRESSION IS OFF BY DEFAULT (DEFAULT_MIN_CELL_COUNT = 0). Turning it
+        on by default would silently change the statistical content of every
+        profile -- a 5-row test frame would collapse entirely at K=5 -- and
+        suppression is a policy decision belonging to whoever holds the data,
+        not a default a library should make on their behalf. The answer to
+        "then nobody will use it" is not a coerced default; it is the
+        disclosure summary, which reports how many embedded values fall below
+        RECOMMENDED_MIN_CELL_COUNT whether or not the flag was passed.
         """
         counts = vals.value_counts()
         # _is_categorical already bounds n_unique; head() is a belt-and-braces
@@ -885,7 +1002,24 @@ class DatasetProfiler:
         # number of real values into a spec file.
         chosen = counts.head(self._categorical_value_cap)
         total = float(chosen.sum())
-        values = {str(k): round(float(v) / total, 4) for k, v in chosen.items()}
+        values = {str(k): float(v) / total for k, v in chosen.items()}
+
+        source_counts = (full_vals.value_counts()
+                         if full_vals is not None else counts)
+
+        rare = sum(1 for label in values
+                   if int(source_counts.get(label, 0)) < RECOMMENDED_MIN_CELL_COUNT)
+
+        suppressed = 0
+        if self.min_cell_count > 0:
+            values, suppressed = _suppress_small_cells(
+                values, source_counts, self.min_cell_count)
+            rare = sum(1 for label in values
+                       if label != OTHER_BUCKET_LABEL
+                       and int(source_counts.get(label, 0))
+                       < RECOMMENDED_MIN_CELL_COUNT)
+
+        values = {k: round(v, 4) for k, v in values.items()}
 
         redacted = False
         if self.redact_categoricals:
@@ -894,6 +1028,9 @@ class DatasetProfiler:
 
         return CategoricalProfile(
             values=values, null_rate=0.0, redacted=redacted,
+            min_cell_count=self.min_cell_count or None,
+            suppressed_values=suppressed,
+            rare_value_count=rare,
         )
 
     @property
