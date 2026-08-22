@@ -55,13 +55,45 @@ compatible **Spec** with `generator: auto` and embedded `profile` statistics
 The generation engine then re-synthesizes a statistically similar dataset:
 
 ```bash
-syntab profile consumer_complaints.parquet --out spec.yaml --sample 5000
+syntab profile your_data.parquet --out spec.yaml --sample 5000
 syntab generate --spec spec.yaml --out ./synthetic --format csv
 ```
 
-See `examples/profiled_consumer_complaints.yaml` (profiled from the public
-CFPB consumer-finance-complaints dataset on HuggingFace) and its synthesized
-`examples/profiled_consumer_complaints_sample.parquet`.
+For the *shape* of a profiled spec, see the two committed examples:
+[`examples/spec_profiled.json`](examples/spec_profiled.json) and
+[`examples/demos/05_profiled_roundtrip.json`](examples/demos/05_profiled_roundtrip.json).
+Both are hand-authored with synthetic values, so they show the format without
+embedding anything real.
+
+### Reproducing the CFPB walkthrough
+
+The worked example referenced below profiles the public CFPB
+consumer-finance-complaints dataset. **Neither the source extract nor the spec
+profiled from it is committed** — both are gitignored, because a profiled spec
+records the real distinct values and exact frequencies of every categorical
+column. See the header comment in [`.gitignore`](.gitignore) for the rationale;
+treat a profiled spec as derived from the source data, not as source code.
+To regenerate them locally:
+
+```bash
+# 1. fetch the dataset yourself (gitignored: data/ and *.parquet)
+mkdir -p data
+#    e.g. from HuggingFace: CFPB consumer-finance-complaints
+#    -> data/consumer_complaints.parquet
+
+# 2. profile it (gitignored: examples/profiled_*)
+syntab profile data/consumer_complaints.parquet \
+    --out examples/profiled_consumer_complaints.yaml --sample 5000
+
+# 3. synthesize from the profile
+syntab generate --spec examples/profiled_consumer_complaints.yaml \
+    --out ./synthetic --format parquet
+
+# 4. compare real vs synthetic (gitignored: validation_report.json)
+syntab compare --real data/consumer_complaints.parquet \
+    --synthetic ./synthetic/consumer_complaints.parquet \
+    --out examples/validation_report.json
+```
 
 ## Validating synthetic vs real data
 The `validate` module compares real and synthetic datasets **column by column**
@@ -85,7 +117,8 @@ print(report.to_text())
 syntab compare --real data.csv --synthetic out.csv --out report.json
 ```
 
-A real run on the profiled CFPB data (`examples/validation_report.json`) shows
+A real run on the profiled CFPB data (step 4 above, which writes
+`examples/validation_report.json` locally — gitignored, not committed) shows
 categorical columns matching with TVD ≈ 0.01–0.02 and numeric/datetime
 distances within tolerance — the synthetic data closely matches the original.
 To enable this, numeric synthesis samples from the detected distribution
