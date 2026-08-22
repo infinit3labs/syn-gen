@@ -170,7 +170,10 @@ class DatasetProfiler:
         n = len(sdf)
         cols: List[ColumnSpec] = []
         for c in df.columns:
-            spec = self._profile_column(str(c), sdf[c], n)
+            # The sample drives the expensive shape work; the full column is
+            # passed alongside it so facts that must be true of the whole
+            # dataset (nullability, uniqueness) are checked against all of it.
+            spec = self._profile_column(str(c), sdf[c], full=df[c])
             if spec is not None:
                 cols.append(spec)
         pk = self._detect_pk(cols)
@@ -299,25 +302,64 @@ class DatasetProfiler:
                 cts.metadata = md
 
     # ----- internals -----
-    def _profile_column(self, name: str, series: pd.Series, n: int) -> Optional[ColumnSpec]:
+    @staticmethod
+    def _validate_unique(sample: pd.Series, full: Optional[pd.Series]) -> bool:
+        """Decide uniqueness by candidate generation + validation.
+
+        The sample can only ever *nominate* a candidate. Any column with more
+        distinct values than the sample size is unique within a sample draw by
+        construction, which is precisely the set of high-cardinality columns
+        someone would want to test for keyhood -- so a sample-only verdict is
+        wrong exactly where it matters. This is the structure sampling-based
+        dependency discovery uses (HyFD and its descendants): cheap sampling
+        proposes candidates, then every candidate is confirmed against the
+        full data before it is believed.
+
+        Validation is ``pandas.Series.is_unique`` -- one hash-table pass, and
+        far cheaper than the sort a hand-rolled check would reach for. Nulls
+        are dropped first to match the conformance checker, which follows SQL
+        in not treating repeated NULLs as duplicate key values.
+        """
+        if len(sample) == 0:
+            return False
+        if int(sample.nunique()) != len(sample):
+            return False  # not even a candidate
+        if full is None:
+            return True
+        return bool(full.dropna().is_unique)
+
+    def _profile_column(self, name: str, series: pd.Series,
+                        full: Optional[pd.Series] = None) -> Optional[ColumnSpec]:
         s = series.dropna()
-        null_rate = round(1 - len(s) / n, 4) if n else 1.0
         if len(s) == 0:
             return None  # fully-null column: skip
 
+        # Nullability comes from the FULL column, never the sample. A column
+        # that is null in one row per million shows zero nulls in a 5k draw;
+        # the profiler then wrote ``nullable: false``, and ``syntab check``
+        # hard-failed the source dataset against its own spec on the first
+        # real null. ``isna().sum()`` is a single vectorized pass, so there is
+        # no performance reason to have approximated this from a sample.
+        stats_src = full if full is not None else series
+        total = len(stats_src)
+        n_nulls = int(stats_src.isna().sum())
+        null_rate = round(n_nulls / total, 4) if total else 1.0
+
         dtype, profile = self._infer_type_and_profile(s)
         params: dict = {}
-        constraints: dict = {"nullable": null_rate > 0, "null_rate": null_rate}
+        constraints: dict = {"nullable": n_nulls > 0, "null_rate": null_rate}
 
-        # uniqueness
-        n_unique = int(s.nunique())
-        unique = n_unique == len(s) and len(s) > 0
+        # uniqueness: nominated on the sample, confirmed on the full column
+        unique = self._validate_unique(s, full)
         if unique:
             constraints["unique"] = True
 
         generator = "auto"
-        # integer id-like sequential column -> sequence
-        if dtype == "int" and unique and self._looks_sequential(s):
+        # Integer id-like sequential column -> sequence. Also decided on the
+        # full column: a random sample of a contiguous sequence has gaps, so
+        # asking the sample can only ever produce a false negative here.
+        seq_src = full.dropna() if full is not None else s
+        if dtype == "int" and unique and self._looks_sequential(seq_src):
             generator = "sequence"
 
         spec = ColumnSpec(
