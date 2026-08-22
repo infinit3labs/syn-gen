@@ -27,6 +27,43 @@ class SpecMetadata(BaseModel):
     license: Optional[str] = None
 
 
+class InferenceProvenance(BaseModel):
+    """Where an inferred rule came from, and how strong the evidence was.
+
+    Attached to anything the profiler decides rather than reads: a primary
+    key, a foreign key, a functional dependency. The point is that a profiled
+    spec is a *draft* a human edits, and until now nothing in the file
+    distinguished "SPIDER proved this inclusion dependency over 208,398 rows"
+    from "a column name ended in _id". Those warrant different amounts of
+    trust and different review effort.
+
+    ``fingerprint`` is what makes re-profiling non-destructive. It records the
+    value the profiler itself wrote. On a re-profile, a rule whose current
+    value no longer matches its fingerprint was changed by a human, so the
+    change is preserved and ``human_edited`` is set rather than the edit being
+    silently overwritten. See ``profiler.merge_preserving_edits``.
+    """
+
+    # "HyFD" | "Pyro" | "HyUCC" | "SPIDER" | "name-heuristic" | "human"
+    algorithm: str
+    citation: Optional[str] = None
+    # "exact" | "g1" | "ind_error" | "name-match"
+    measure: Optional[str] = None
+    confidence: Optional[float] = None
+    error: Optional[float] = None
+    # Cardinality-corrected dependency measure (Piatetsky-Shapiro & Matheus,
+    # KDD-93). Recorded separately from ``confidence`` because they answer
+    # different questions: confidence is how often the rule holds, mu_prime is
+    # how much of that is explained by the determinant's cardinality alone.
+    mu_prime: Optional[float] = None
+    # Rows the rule was measured against.
+    support: Optional[int] = None
+    # "full" | "sample" -- whether the evidence is the whole dataset or a draw.
+    validated_on: Optional[str] = None
+    human_edited: bool = False
+    fingerprint: Optional[str] = None
+
+
 class NumericProfile(BaseModel):
     min: Optional[float] = None
     max: Optional[float] = None
@@ -134,6 +171,9 @@ class RelationshipSpec(BaseModel):
     # Self-referencing relationships only: cap the tree depth so hierarchies
     # stay realistic (e.g. an org chart with at most N reporting levels).
     max_depth: Optional[int] = None
+    # How this relationship was inferred, when it was inferred rather than
+    # authored. None on a hand-written spec.
+    provenance: Optional[InferenceProvenance] = None
 
     model_config = {"populate_by_name": True}
 
@@ -179,6 +219,8 @@ class TableSpec(BaseModel):
     name: str
     row_count: int
     primary_key: Optional[Union[str, List[str]]] = None
+    # Evidence for ``primary_key`` when it was discovered rather than declared.
+    key_provenance: Optional[InferenceProvenance] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     columns: List[ColumnSpec]
     unique_constraints: List[List[str]] = Field(default_factory=list)
