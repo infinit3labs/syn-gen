@@ -11,6 +11,7 @@ import pandas as pd
 
 from . import formats
 from . import generators
+from .disclosure import DisclosureReport
 from .engine import GenerationEngine, SpecError
 from .loaders import from_file, spec_to_dict, to_file
 from .profiler import (
@@ -232,6 +233,11 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         f"Profiled {len(datasets)} dataset(s) -> {out}: "
         f"{len(spec.tables)} table(s), {n_rel} relationship(s), {n_pii} PII column(s)"
     )
+    # The disclosure summary goes to stderr, deliberately. It is a notice about
+    # the artefact rather than part of it, and stderr is the stream that
+    # survives `syntab profile ... | tee`, redirection and CI log capture -- the
+    # situations in which someone is least likely to be reading closely.
+    click.echo(DisclosureReport.from_spec(spec).to_text(spec_path=out), err=True)
 
 
 def _read_any(path: str) -> pd.DataFrame:

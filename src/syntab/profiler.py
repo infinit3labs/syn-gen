@@ -559,6 +559,8 @@ class DatasetProfiler:
 
     def _build_table_spec(self, df: pd.DataFrame, name: str, source: str) -> TableSpec:
         source_rows = len(df)
+        # per-table, so a profiler reused across tables does not accumulate
+        self.identifying_key_candidates = []
         if self.sample and source_rows > self.sample:
             sdf = df.sample(n=self.sample, random_state=self.seed)
         else:
@@ -592,6 +594,14 @@ class DatasetProfiler:
                     "source_row_count": source_rows,
                     "sampled_rows": n,
                     "sampled": n < source_rows,
+                    # id-like columns whose base name looks identifying
+                    # (patient_id). Not auto-flagged, because anonymizing a key
+                    # breaks PK/FK integrity -- recorded so the disclosure
+                    # summary can put them in front of a human. See
+                    # pii_name_signal.__doc__.
+                    **({"identifying_key_candidates":
+                        list(self.identifying_key_candidates)}
+                       if self.identifying_key_candidates else {}),
                 }
             },
         )
