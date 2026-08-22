@@ -68,6 +68,50 @@ def _string_pattern(values: List[str]) -> str:
     return "".join(out)
 
 
+# Identifier tokenization. Splits snake_case, kebab-case, space-separated and
+# camelCase/PascalCase names into word tokens while keeping runs of capitals
+# together, so "Complaint ID" -> ["Complaint", "ID"] and "userId" ->
+# ["user", "Id"]. This is the conventional identifier-splitting alternation;
+# the order matters, because the all-caps run has to be tried before the
+# single-capital-then-lowercase form.
+_NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+# Trailing tokens that mark a column as an identifier.
+_ID_TOKENS = {"id", "uuid", "guid"}
+
+
+def _name_tokens(name: str) -> List[str]:
+    return _NAME_TOKEN_RE.findall(name or "")
+
+
+def _is_id_like(name: str) -> bool:
+    """Whether a column name ends in an identifier *token*.
+
+    Substring matching -- ``name.lower().endswith("id")`` -- is wrong here. It
+    accepts ``paid``, ``void``, ``valid``, ``bid``, ``grid``, ``rapid``,
+    ``humid``, ``squid`` and anything else that happens to end in those two
+    letters, and a float column called ``paid`` was being promoted to primary
+    key ahead of the real one. Tokenizing the name and testing only the final
+    token fixes the whole class of false positives at once, and removes the
+    need for the per-dataset exception ("complaint id") that had been added to
+    paper over one instance of it.
+    """
+    tokens = _name_tokens(name)
+    return bool(tokens) and tokens[-1].lower() in _ID_TOKENS
+
+
+def _id_base(name: str) -> Optional[str]:
+    """For an id-like name, the normalized prefix before the id token.
+
+    ``user_id`` / ``userId`` / ``User ID`` -> ``user``. Returns None when the
+    name is a bare identifier (``id``) or is not id-like at all.
+    """
+    tokens = _name_tokens(name)
+    if len(tokens) < 2 or tokens[-1].lower() not in _ID_TOKENS:
+        return None
+    return "_".join(t.lower() for t in tokens[:-1])
+
+
 class DatasetProfiler:
     def __init__(
         self,
@@ -513,14 +557,22 @@ class DatasetProfiler:
             return False
 
     def _detect_pk(self, cols: List[ColumnSpec]) -> Optional[str]:
-        candidates = [c for c in cols if c.constraints.get("unique")]
+        # A primary key is UNIQUE *and* NOT NULL. Only the first half was
+        # being checked, so a unique-but-nullable column could be nominated
+        # and would then fail the conformance checker's own PK check, because
+        # pandas' ``duplicated`` counts repeated NaNs as duplicates where SQL
+        # UNIQUE does not.
+        candidates = [
+            c for c in cols
+            if c.constraints.get("unique")
+            and not c.constraints.get("nullable", True)
+        ]
         if not candidates:
             return None
         for c in candidates:
-            low = c.name.lower()
-            if low in ("id", "complaint id") or low.endswith("id") or low.endswith("_id"):
+            if _is_id_like(c.name):
                 return c.name
-        # otherwise first unique integer column
+        # otherwise first unique integer/string column
         for c in candidates:
             if c.dtype in ("int", "str"):
                 return c.name
