@@ -1,0 +1,141 @@
+# =============================================================================
+# syntab .gitignore
+#
+# syntab reads REAL datasets and writes profiles derived from them. Two classes
+# of file must never reach the repository:
+#
+#   1. source datasets      - the real data itself
+#   2. profiler output      - a profiled spec records the actual distinct
+#                             values of every low-cardinality column together
+#                             with their exact frequencies, plus real min/max
+#                             for numeric columns. That is derived real data,
+#                             not source code. Treat it accordingly.
+#
+# The tabular-format rules below are deliberately blanket rules. Small,
+# intentional test fixtures live under tests/fixtures/ and are re-included.
+# =============================================================================
+
+# --- Real source datasets ----------------------------------------------------
+data/
+datasets/
+raw/
+input/
+
+# --- Tabular data formats (blanket: opt in, never opt out) -------------------
+*.parquet
+*.feather
+*.arrow
+*.orc
+*.avro
+*.csv
+*.tsv
+*.psv
+*.jsonl
+*.ndjson
+*.xls
+*.xlsx
+*.xlsm
+*.sav
+*.dta
+*.h5
+*.hdf5
+*.db
+*.sqlite
+*.sqlite3
+*.csv.gz
+*.csv.bz2
+*.csv.zst
+*.parquet.gz
+
+# Intentional, hand-authored, synthetic test fixtures are allowed.
+!tests/fixtures/
+!tests/fixtures/**
+
+# --- Profiler / validator output ---------------------------------------------
+# Emitted by `syntab profile` and `syntab compare`. Regenerable, and may
+# embed real values, exact frequencies and real numeric ranges.
+examples/profiled_*
+validation_report.json
+*_validation_report.json
+conformance_report.json
+profile_report.json
+
+# --- Generated output directories ---------------------------------------------
+output/
+outputs/
+examples/demos/output/
+examples/mock_specs/output/
+examples/mock_specs/datasets/
+
+# --- Credentials and secrets ---------------------------------------------------
+# If an example is needed, commit `.env.example` and nothing else.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+.netrc
+.pgpass
+.htpasswd
+credentials
+credentials.*
+secrets.*
+*secret*.json
+*service-account*.json
+*service_account*.json
+.aws/
+.gcloud/
+gha-creds-*.json
+
+# --- Notebooks (may carry embedded output containing real data) ----------------
+*.ipynb
+.ipynb_checkpoints/
+
+# --- Python ---------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+.eggs/
+MANIFEST
+
+# --- Environments ----------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Tooling caches ---------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.cache/
+
+# --- Editors and OS ----------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,143 @@
+spec_version: "1.0"
+metadata:
+  name: mock_ecommerce
+  description: >
+    Mock spec demonstrating custom business rules (DSL), in-table constraints
+    (primary key, uniqueness, depends_on, computed columns) and cross-table
+    constraints (foreign keys + cross-join rules via parent aliases). It also
+    shows consistent application of keys across three tables: every order
+    references an existing customer, and every order item references an existing
+    order AND reuses that order's customer_id, so keys line up end to end.
+  tags: [mock, relational, business-rules, cross-table, keys]
+  source: hand-authored
+settings:
+  seed: 1234
+  fallback: raise
+  max_rule_attempts: 500
+
+tables:
+  - name: customers
+    row_count: 80
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: name
+        dtype: str
+        generator: faker.name
+        pii: true
+      - name: region
+        dtype: str
+        generator: choice
+        params: {values: [EU, US, APAC], weights: [0.4, 0.4, 0.2]}
+      - name: tier
+        dtype: str
+        generator: choice
+        params: {values: [basic, silver, gold, platinum], weights: [0.5, 0.3, 0.15, 0.05]}
+      - name: credit_limit
+        dtype: float
+        generator: float
+        params: {min: 500, max: 20000, decimals: 2}
+      - name: signup_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2020-01-01", end: "2024-06-30"}
+
+  - name: orders
+    row_count: 500
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: customer_id
+        dtype: int
+        generator: fk
+        params: {ref: customers.id}
+      - name: region
+        dtype: str
+        generator: choice
+        params: {values: [EU, US, APAC], weights: [0.4, 0.4, 0.2]}
+      - name: status
+        dtype: str
+        generator: choice
+        params: {values: [pending, paid, shipped, refunded], weights: [0.2, 0.5, 0.25, 0.05]}
+      - name: order_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2023-01-01", end: "2024-12-31"}
+      - name: total
+        dtype: float
+        generator: float
+        params: {min: 10, max: 2000, decimals: 2}
+      - name: discount
+        dtype: float
+        generator: float
+        params: {min: 0, max: 200, decimals: 2}
+        depends_on: [total]
+      - name: loyalty_points
+        dtype: int
+        generator: float
+        params: {min: 0, max: 50, decimals: 0}
+    relationships:
+      - from: customer_id
+        to: customers.id
+        alias: customer
+    rules:
+      # --- in-table business rules -----------------------------------------
+      - "discount <= total * 0.3"
+      - "total > 0"
+      - "if total > 1000 then discount >= total * 0.05"
+      - "status != 'cancelled' and total > 0"
+      # --- cross-table (cross-join) business rules --------------------------
+      - "region == customer.region"
+      - "total <= customer.credit_limit"
+
+  - name: order_items
+    row_count: 1500
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: order_id
+        dtype: int
+        generator: fk
+        params: {ref: orders.id}
+      - name: product
+        dtype: str
+        generator: choice
+        params: {values: [widget, gadget, gizmo, thingamajig], weights: [0.4, 0.3, 0.2, 0.1]}
+      - name: quantity
+        dtype: int
+        generator: int
+        params: {min: 1, max: 20}
+      - name: unit_price
+        dtype: float
+        generator: float
+        params: {min: 1, max: 500, decimals: 2}
+      - name: line_total
+        dtype: float
+        generator: examples.mock_specs.gen_helpers:LineTotalGenerator
+        params: {decimals: 2}
+        depends_on: [unit_price, quantity]
+      # customer_id is derived from the parent order, NOT a free foreign key,
+      # so it is guaranteed to match the order's customer by construction.
+      - name: customer_id
+        dtype: int
+        generator: examples.mock_specs.gen_helpers:order_customer_id
+    relationships:
+      - from: order_id
+        to: orders.id
+        alias: order
+    rules:
+      # --- in-table business rules ------------------------------------------
+      - "quantity > 0"
+      - "unit_price >= 0"
+      - "line_total == unit_price * quantity"
+      # --- cross-table key consistency --------------------------------------
+      - "customer_id == order.customer_id"

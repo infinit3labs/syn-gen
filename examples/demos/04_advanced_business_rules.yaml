@@ -1,0 +1,91 @@
+spec_version: "1.0"
+metadata:
+  name: advanced_business_rules
+  description: >
+    Advanced demo of the business-rule DSL: within-table constraints
+    (discount <= total, end_date >= start_date) and cross-join constraints
+    (region == customer.region, total <= customer.credit_limit, conditional
+    EU tax). Enforced with the hybrid rejection-sampling strategy.
+  tags: [demo, advanced, rules, cross-join]
+  source: hand-authored
+settings:
+  seed: 42
+  fallback: raise
+  max_rule_attempts: 300
+tables:
+  - name: customers
+    row_count: 60
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: name
+        dtype: str
+        generator: faker.name
+        pii: true
+      - name: region
+        dtype: str
+        generator: choice
+        params: {values: [EU, US, APAC], weights: [0.4, 0.4, 0.2]}
+      - name: credit_limit
+        dtype: float
+        generator: float
+        params: {min: 500, max: 20000, decimals: 2}
+      - name: signup_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2020-01-01", end: "2024-06-30"}
+      - name: vip
+        dtype: bool
+        generator: bool
+        params: {p: 0.2}
+  - name: orders
+    row_count: 400
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: customer_id
+        dtype: int
+        generator: fk
+        params: {ref: customers.id}
+      - name: region
+        dtype: str
+        generator: choice
+        params: {values: [EU, US, APAC], weights: [0.4, 0.4, 0.2]}
+      - name: total
+        dtype: float
+        generator: float
+        params: {min: 10, max: 2000, decimals: 2}
+      - name: discount
+        dtype: float
+        generator: float
+        params: {min: 0, max: 200, decimals: 2}
+        depends_on: [total]
+      - name: tax
+        dtype: float
+        generator: float
+        params: {min: 0, max: 0.3, decimals: 3}
+      - name: start_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2023-01-01", end: "2024-06-30"}
+      - name: end_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2023-01-01", end: "2024-12-31"}
+        depends_on: [start_date]
+    relationships:
+      - from: customer_id
+        to: customers.id
+        alias: customer
+    rules:
+      - "discount <= total * 0.3"
+      - "end_date >= start_date"
+      - "region == customer.region"
+      - "total <= customer.credit_limit"
+      - "if region == 'EU' then tax > 0"

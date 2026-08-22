@@ -1,0 +1,74 @@
+spec_version: "1.0"
+metadata:
+  name: shop
+  description: Users and orders with relational integrity, custom gens, and business rules.
+  tags: [demo, relational]
+  source: hand-authored
+  owner: data-team
+settings:
+  seed: 42
+  fallback: raise
+  max_rule_attempts: 200
+tables:
+  - name: users
+    row_count: 200
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: name
+        dtype: str
+        generator: faker.name
+        pii: true
+      - name: email
+        dtype: str
+        generator: faker.email
+        constraints: {unique: true}
+      - name: age
+        dtype: int
+        generator: int
+        params: {min: 18, max: 90}
+      - name: region
+        dtype: str
+        generator: choice
+        params: {values: [EU, US, APAC], weights: [0.4, 0.4, 0.2]}
+      - name: credit_limit
+        dtype: float
+        generator: float
+        params: {min: 100, max: 10000, decimals: 2}
+  - name: orders
+    row_count: 1000
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: user_id
+        dtype: int
+        generator: fk
+        params: {ref: users.id}
+      - name: region
+        dtype: str
+        generator: custom_gen:order_region
+        depends_on: [user_id]
+      - name: total
+        dtype: float
+        generator: float
+        params: {min: 1, max: 500, decimals: 2}
+      - name: discount
+        dtype: float
+        generator: float
+        params: {min: 0, max: 50, decimals: 2}
+        depends_on: [total]
+    relationships:
+      - from: user_id
+        to: users.id
+        alias: user
+    rules:
+      - "discount <= total * 0.5"
+      - "region == user.region"
+      - "total <= user.credit_limit"
+      - "if region == 'EU' then total > 0"

@@ -1,0 +1,65 @@
+spec_version: "1.0"
+metadata:
+  name: advanced_custom_generators
+  description: >
+    Advanced demo of custom generators: a stateful BaseGenerator subclass
+    (SkuGenerator), and @register_generator functions that read a joined
+    parent row (local_title, region_phone). Referenced by import path.
+  tags: [demo, advanced, custom-generators]
+  source: hand-authored
+settings:
+  seed: 21
+  fallback: raise
+  max_rule_attempts: 100
+tables:
+  - name: sellers
+    row_count: 20
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: name
+        dtype: str
+        generator: faker.company
+      - name: country
+        dtype: str
+        generator: choice
+        params: {values: [US, UK, DE, FR], weights: [0.4, 0.2, 0.2, 0.2]}
+      - name: region
+        dtype: str
+        generator: choice
+        params: {values: [EU, US, APAC], weights: [0.4, 0.4, 0.2]}
+  - name: listings
+    row_count: 120
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: seller_id
+        dtype: int
+        generator: fk
+        params: {ref: sellers.id}
+      - name: sku
+        dtype: str
+        generator: demo_generators:SkuGenerator
+        params: {prefix: LIST}
+      - name: title
+        dtype: str
+        generator: demo_generators:local_title
+        depends_on: [seller_id]
+      - name: contact_phone
+        dtype: str
+        generator: demo_generators:region_phone
+        depends_on: [seller_id]
+      - name: price
+        dtype: float
+        generator: float
+        params: {min: 5, max: 500, decimals: 2}
+    relationships:
+      - from: seller_id
+        to: sellers.id
+        alias: seller

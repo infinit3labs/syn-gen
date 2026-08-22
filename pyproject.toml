@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "syntab"
+version = "0.1.0"
+description = "Spec-driven synthetic tabular/relational data generator with custom generators, a business-rule DSL, and profiling-ready Specs."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml",
+    "faker",
+    "pandas",
+    "click",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow"]
+dev = ["pytest", "pyarrow"]
+
+[project.scripts]
+syntab = "syntab.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/syntab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

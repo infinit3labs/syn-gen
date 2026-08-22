@@ -1,0 +1,44 @@
+{
+  "spec_version": "1.0",
+  "metadata": {
+    "name": "profiled_web_events",
+    "description": "Profiler-style Spec: generators inferred from embedded profile stats (generator: auto). This is the format a future profiling module would emit to re-synthesize a compatible dataset.",
+    "tags": ["demo", "advanced", "profiling", "round-trip"],
+    "source": "profiled:events.csv"
+  },
+  "settings": {"seed": 99, "fallback": "raise", "max_rule_attempts": 100},
+  "tables": [
+    {
+      "name": "events",
+      "row_count": 300,
+      "primary_key": "id",
+      "columns": [
+        {"name": "id", "dtype": "int", "generator": "sequence", "constraints": {"unique": true}},
+        {
+          "name": "event_type",
+          "dtype": "str",
+          "generator": "auto",
+          "profile": {"categorical": {"values": {"click": 0.6, "view": 0.3, "purchase": 0.1}, "null_rate": 0.0}}
+        },
+        {
+          "name": "duration_ms",
+          "dtype": "float",
+          "generator": "auto",
+          "profile": {"numeric": {"min": 10, "max": 5000, "mean": 800, "std": 400, "distribution": "normal"}}
+        },
+        {
+          "name": "country",
+          "dtype": "str",
+          "generator": "auto",
+          "profile": {"categorical": {"values": {"US": 0.5, "GB": 0.3, "DE": 0.2}}}
+        },
+        {
+          "name": "session_id",
+          "dtype": "str",
+          "generator": "auto",
+          "profile": {"string_pattern": "????????", "length": [8, 8]}
+        }
+      ]
+    }
+  ]
+}

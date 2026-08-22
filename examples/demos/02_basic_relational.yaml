@@ -1,0 +1,59 @@
+spec_version: "1.0"
+metadata:
+  name: basic_store
+  description: Basic relational demo — two tables joined by a foreign key.
+  tags: [demo, basic, relational]
+  source: hand-authored
+settings:
+  seed: 7
+  fallback: raise
+  max_rule_attempts: 100
+tables:
+  - name: customers
+    row_count: 50
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: name
+        dtype: str
+        generator: faker.name
+        pii: true
+      - name: email
+        dtype: str
+        generator: faker.email
+        constraints: {unique: true}
+      - name: country
+        dtype: str
+        generator: choice
+        params: {values: [US, UK, DE, FR], weights: [0.5, 0.2, 0.15, 0.15]}
+  - name: orders
+    row_count: 300
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: customer_id
+        dtype: int
+        generator: fk
+        params: {ref: customers.id}
+      - name: amount
+        dtype: float
+        generator: float
+        params: {min: 10, max: 1000, decimals: 2}
+      - name: status
+        dtype: str
+        generator: choice
+        params: {values: [pending, paid, shipped, refunded], weights: [0.2, 0.5, 0.25, 0.05]}
+      - name: created_at
+        dtype: datetime
+        generator: datetime
+        params: {start: "2023-01-01", end: "2024-12-31"}
+    relationships:
+      - from: customer_id
+        to: customers.id
+        alias: customer

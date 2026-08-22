@@ -1,0 +1,43 @@
+spec_version: "1.0"
+metadata:
+  name: basic_employees
+  description: Basic single-table demo — built-in generators and Faker providers.
+  tags: [demo, basic, single-table]
+  source: hand-authored
+settings:
+  seed: 123
+  fallback: raise
+  max_rule_attempts: 100
+tables:
+  - name: employees
+    row_count: 100
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: full_name
+        dtype: str
+        generator: faker.name
+        pii: true
+      - name: email
+        dtype: str
+        generator: faker.email
+        constraints: {unique: true}
+      - name: department
+        dtype: str
+        generator: choice
+        params: {values: [Engineering, Sales, Marketing, Support], weights: [0.4, 0.3, 0.2, 0.1]}
+      - name: salary
+        dtype: float
+        generator: float
+        params: {min: 40000, max: 160000, decimals: 2}
+      - name: hire_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2015-01-01", end: "2024-12-31"}
+      - name: active
+        dtype: bool
+        generator: bool
+        params: {p: 0.85}

@@ -1,0 +1,68 @@
+spec_version: "1.0"
+metadata:
+  name: mock_accounts
+  description: >
+    Mock spec focused on in-table custom business rules written in the DSL:
+    conditional logic (if/then), boolean combinators (and/or/not), helper
+    functions (days_between, coalesce, abs, min, max) and column dependencies
+    (closed_date generated after opened_date). Cross-table behaviour is covered
+    by mock_ecommerce.yaml.
+  tags: [mock, business-rules, dsl, in-table]
+  source: hand-authored
+settings:
+  seed: 99
+  fallback: raise
+  max_rule_attempts: 500
+
+tables:
+  - name: accounts
+    row_count: 400
+    primary_key: id
+    columns:
+      - name: id
+        dtype: int
+        generator: sequence
+        constraints: {unique: true}
+      - name: account_type
+        dtype: str
+        generator: choice
+        params: {values: [checking, savings], weights: [0.6, 0.4]}
+      - name: status
+        dtype: str
+        generator: choice
+        params: {values: [open, closed, frozen], weights: [0.7, 0.2, 0.1]}
+      - name: opened_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2015-01-01", end: "2024-01-01"}
+      - name: closed_date
+        dtype: datetime
+        generator: datetime
+        params: {start: "2015-01-01", end: "2024-12-31"}
+        depends_on: [opened_date]
+      - name: balance
+        dtype: float
+        generator: float
+        params: {min: -500, max: 100000, decimals: 2}
+      - name: overdraft_limit
+        dtype: float
+        generator: examples.mock_specs.gen_helpers:overdraft_limit_for
+        params: {max: 1000}
+      - name: last_activity
+        dtype: datetime
+        generator: datetime
+        params: {start: "2015-01-01", end: "2025-01-01"}
+    rules:
+      # ordering / dependencies
+      - "closed_date >= opened_date"
+      - "days_between(closed_date, opened_date) >= 0"
+      # conditional logic with if/then
+      - "if account_type == 'savings' then overdraft_limit == 0"
+      - "if status == 'closed' then closed_date >= opened_date"
+      # boolean combinators (and / or / not)
+      - "balance >= 0 or status == 'frozen'"
+      - "not (status == 'open' and balance < 0)"
+      # helper functions
+      - "coalesce(balance, 0) >= -1000"
+      - "abs(balance) >= 0"
+      - "min(balance, 0) <= 0"

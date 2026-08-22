@@ -1,0 +1,46 @@
+{
+  "spec_version": "1.0",
+  "metadata": {
+    "name": "profiled_orders",
+    "description": "Example Spec emitted by a (future) profiler: generators inferred from profile stats.",
+    "source": "profiled:orders.csv"
+  },
+  "settings": {"seed": 7, "fallback": "raise", "max_rule_attempts": 100},
+  "tables": [
+    {
+      "name": "orders",
+      "row_count": 500,
+      "primary_key": "id",
+      "columns": [
+        {
+          "name": "id",
+          "dtype": "int",
+          "generator": "sequence",
+          "constraints": {"unique": true}
+        },
+        {
+          "name": "category",
+          "dtype": "str",
+          "generator": "auto",
+          "profile": {
+            "categorical": {"values": {"books": 0.5, "music": 0.3, "films": 0.2}, "null_rate": 0.0}
+          }
+        },
+        {
+          "name": "amount",
+          "dtype": "float",
+          "generator": "auto",
+          "profile": {
+            "numeric": {"min": 5.0, "max": 250.0, "mean": 60.0, "std": 20.0, "distribution": "normal", "null_rate": 0.0}
+          }
+        },
+        {
+          "name": "code",
+          "dtype": "str",
+          "generator": "auto",
+          "profile": {"string_pattern": "??##??", "length": [6, 6]}
+        }
+      ]
+    }
+  ]
+}
