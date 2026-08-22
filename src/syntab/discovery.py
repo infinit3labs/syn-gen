@@ -429,6 +429,59 @@ def g1_error(df: pd.DataFrame, determinant: Sequence[str], dependent: str) -> fl
     return float(((cx ** 2).sum() - (cxy ** 2).sum()) / (n * n))
 
 
+def dependency_measures(
+    df: pd.DataFrame,
+    determinant: Sequence[str],
+    dependent: str,
+    _group_sizes: Optional[Dict[Tuple[str, ...], "pd.Series"]] = None,
+) -> Tuple[float, Optional[float]]:
+    """Both measures of X -> Y in one pass: (g1 error, mu\').
+
+    ``g1_error`` and ``mu_prime`` each need the same two group-by results --
+    the sizes of the X groups and of the X,Y groups -- and validating a
+    candidate needs both. Computing them separately did the work twice: on the
+    208k-row CFPB source, 272 candidates cost 13.2 s of g1 plus 17.0 s of mu\'.
+    This shares the group-bys and caches the X sizes across candidates with the
+    same determinant, which most candidates have.
+
+    Returns ``mu' = None`` for an empty determinant, where it is undefined (a
+    constant column is not a dependency anyone acts on, and the empty-LHS FD
+    already says the column is constant).
+    """
+    n = len(df)
+    xs = list(determinant)
+    if n < 2:
+        return 0.0, None
+    if not xs:
+        counts = df[dependent].value_counts(dropna=False).to_numpy(dtype="float64")
+        return float((n * n - (counts ** 2).sum()) / (n * n)), None
+
+    key = tuple(xs)
+    cx = None if _group_sizes is None else _group_sizes.get(key)
+    if cx is None:
+        cx = df.groupby(xs, dropna=False, observed=True).size().astype("float64")
+        if _group_sizes is not None:
+            _group_sizes[key] = cx
+    cxy = (df.groupby(xs + [dependent], dropna=False, observed=True)
+             .size().astype("float64"))
+
+    sum_cx2 = float((cx ** 2).sum())
+    sum_cxy2 = float((cxy ** 2).sum())
+    g1 = (sum_cx2 - sum_cxy2) / (n * n)
+
+    pdep_y = _pdep_marginal(df[dependent])
+    k = int(len(cx))
+    if pdep_y >= 1.0 or k >= n:
+        return g1, 0.0
+    levels = list(range(len(xs)))
+    per_x = (cxy ** 2).groupby(level=levels, observed=True).sum()
+    pdep_xy = float((per_x / cx.reindex(per_x.index)).sum() / n)
+    mu = 1.0 - ((n - k) / (n - 1)) * (1.0 - pdep_xy) / (1.0 - pdep_y)
+    if math.isnan(mu):
+        mu = 0.0
+    return g1, float(max(0.0, min(1.0, mu)))
+
+
 def holds_exactly(df: pd.DataFrame, determinant: Sequence[str], dependent: str) -> bool:
     """Whether X -> Y holds on every row of ``df``."""
     xs = list(determinant)
@@ -511,11 +564,14 @@ def discover_functional_dependencies(
     support = len(full)
     validated_on = "full"
     out: List[DiscoveredFD] = []
-    for (lhs, rhs), algorithm in candidates.items():
-        err = g1_error(full, lhs, rhs)
+    # Shared across candidates: the X group sizes depend only on the
+    # determinant, and most candidates share one with several others.
+    group_sizes: Dict[Tuple[str, ...], Any] = {}
+    for lhs, rhs in sorted(candidates):
+        algorithm = candidates[(lhs, rhs)]
+        err, mu = dependency_measures(full, lhs, rhs, group_sizes)
         if err > error + 1e-12:
             continue
-        mu = mu_prime(full, lhs, rhs) if lhs else None
         if lhs and (mu is None or mu < min_mu):
             continue
         out.append(DiscoveredFD(

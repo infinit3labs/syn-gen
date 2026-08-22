@@ -225,8 +225,8 @@ MAX_COMPOSITE_UNIQUE_CONSTRAINTS = 3
 
 # Functional-dependency discovery is OFF by default, and that is a considered
 # choice rather than caution. FD discovery is the most expensive thing in this
-# module -- on the 208k-row CFPB source it is the difference between a 3.6 s
-# and a ~40 s profile -- and unlike key and foreign-key discovery its output
+# module -- on the 208k-row CFPB source it is the difference between a 3.3 s
+# and a 20.7 s profile -- and unlike key and foreign-key discovery its output
 # does not currently steer generation (see the commit that removed
 # ``suggested_depends_on`` for exactly why it cannot yet). Paying forty seconds
 # by default for a report nothing consumes would be the wrong trade; paying it

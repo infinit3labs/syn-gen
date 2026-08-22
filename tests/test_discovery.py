@@ -310,3 +310,37 @@ def test_every_result_carries_an_algorithm_and_a_citation():
         assert p.citation
         assert p.support == 300
         assert p.human_edited is False
+
+
+def test_the_shared_pass_agrees_with_the_two_separate_measures():
+    """dependency_measures shares the group-bys g1_error and mu_prime each do
+    on their own. Equivalence is asserted rather than assumed, because the
+    only reason it exists is speed."""
+    rng = np.random.default_rng(11)
+    n = 600
+    df = pd.DataFrame({
+        "a": [f"a{i % 7}" for i in range(n)],
+        "b": [f"b{(i % 7) // 3}" for i in range(n)],
+        "c": rng.integers(0, 4, n).astype(str),
+        "const": ["k"] * n,
+        "key": [f"k{i}" for i in range(n)],
+    })
+    cases = [(["a"], "b"), (["b"], "a"), (["c"], "b"), (["a", "c"], "b"),
+             (["a"], "const"), (["key"], "b"), ([], "const"), ([], "a")]
+    for lhs, rhs in cases:
+        g1, mu = D.dependency_measures(df, lhs, rhs)
+        assert g1 == pytest.approx(D.g1_error(df, lhs, rhs)), (lhs, rhs)
+        if lhs:
+            assert mu == pytest.approx(D.mu_prime(df, lhs, rhs)), (lhs, rhs)
+        else:
+            assert mu is None
+
+
+def test_the_group_size_cache_does_not_change_the_answer():
+    df = pd.DataFrame({"x": [f"x{i % 5}" for i in range(100)],
+                       "y": [f"y{i % 5}" for i in range(100)],
+                       "z": [f"z{i % 3}" for i in range(100)]})
+    cache = {}
+    first = [D.dependency_measures(df, ["x"], c, cache) for c in ("y", "z")]
+    second = [D.dependency_measures(df, ["x"], c) for c in ("y", "z")]
+    assert first == second
