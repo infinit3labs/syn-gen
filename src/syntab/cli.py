@@ -12,7 +12,7 @@ import pandas as pd
 from . import formats
 from . import generators
 from .engine import GenerationEngine, SpecError
-from .loaders import from_file, to_file
+from .loaders import from_file, spec_to_dict, to_file
 from .spec import Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings
 
 
@@ -77,7 +77,6 @@ def list_generators() -> None:
 @cli.command()
 def init() -> None:
     """Print a starter Spec YAML to stdout."""
-    import json as _json
     import yaml as _yaml
 
     spec = Spec(
@@ -114,8 +113,7 @@ def init() -> None:
             ),
         ],
     )
-    data = spec.model_dump(mode="json")
-    click.echo(_yaml.safe_dump(data, sort_keys=False))
+    click.echo(_yaml.safe_dump(spec_to_dict(spec), sort_keys=False))
 
 
 @cli.command()
