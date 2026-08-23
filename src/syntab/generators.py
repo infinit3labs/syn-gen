@@ -12,9 +12,10 @@ import importlib
 import math
 import random
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from faker import Faker
 
@@ -216,11 +217,164 @@ def _g_date(ctx: GenContext) -> Any:
     return val
 
 
-def _g_string(ctx: GenContext) -> Any:
+DEFAULT_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _sample_text_length(ctx: GenContext) -> int:
+    """Pick a value length from whichever length spec the params carry.
+
+    In precedence order:
+
+      * ``length_edges`` + ``length_counts`` -- a histogram of observed
+        lengths, sampled by inverse CDF (same scheme as the numeric
+        ``empirical`` distribution);
+      * ``length_values`` + ``length_weights`` -- an exact discrete
+        distribution, for columns with few distinct lengths;
+      * ``min_length`` / ``max_length`` -- uniform over the observed range;
+      * ``length`` -- a single fixed width, for hand-authored specs.
+
+    A profiled column used to arrive here with ``length`` set to the MAXIMUM
+    observed length, so every generated value came out at the longest width
+    in the source. The first three forms exist so that no longer happens.
+    """
     p = ctx.params
-    length = int(p.get("length", 8))
-    alphabet = p.get("alphabet", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-    return "".join(ctx.rng.choice(alphabet) for _ in range(length))
+    lo = p.get("min_length")
+    hi = p.get("max_length")
+
+    if p.get("length_edges") and p.get("length_counts"):
+        n = int(round(_sample_empirical(ctx.rng, p["length_edges"], p["length_counts"])))
+    elif p.get("length_values"):
+        values = p["length_values"]
+        weights = p.get("length_weights")
+        n = int(ctx.rng.choices(values, weights=weights)[0] if weights
+                else ctx.rng.choice(values))
+    elif lo is not None or hi is not None:
+        a = int(lo if lo is not None else 0)
+        b = int(hi if hi is not None else a)
+        n = ctx.rng.randint(min(a, b), max(a, b))
+    elif p.get("length") is not None:
+        n = int(p["length"])
+    else:
+        n = 8
+
+    if lo is not None:
+        n = max(n, int(lo))
+    if hi is not None:
+        n = min(n, int(hi))
+    return max(0, n)
+
+
+def _g_string(ctx: GenContext) -> Any:
+    """Generate a text value of a sampled length from a sampled alphabet.
+
+    ``char_values`` + ``char_weights`` supply an observed character
+    distribution. Without them the alphabet falls back to a uniform
+    ``[a-zA-Z0-9]``, which is fine for an opaque identifier and badly wrong
+    for free text: it contains no spaces or punctuation and makes digits as
+    common as vowels.
+    """
+    p = ctx.params
+    n = _sample_text_length(ctx)
+    if n == 0:
+        return ""
+
+    chars = p.get("char_values")
+    if chars:
+        weights = p.get("char_weights")
+        picked = (ctx.rng.choices(chars, weights=weights, k=n) if weights
+                  else ctx.rng.choices(chars, k=n))
+        return "".join(picked)
+
+    alphabet = p.get("alphabet", DEFAULT_ALPHABET)
+    return "".join(ctx.rng.choices(alphabet, k=n))
+
+
+def empirical_text_params(
+    values: Iterable[Any],
+    length_bins: int = 32,
+    max_characters: int = 256,
+) -> Dict[str, Any]:
+    """Derive ``string`` generator params from observed text.
+
+    Returns the length distribution and character distribution of ``values``
+    in exactly the form :func:`_g_string` consumes, so that
+
+        params = empirical_text_params(source_column)
+
+    produces text with the source's length profile and character mix instead
+    of fixed-width uniform alphanumeric noise.
+
+    Few distinct lengths are stored exactly (``length_values`` /
+    ``length_weights``); more than ``length_bins`` of them are stored as a
+    histogram (``length_edges`` / ``length_counts``). The character set is
+    truncated to the ``max_characters`` most frequent characters, which for
+    ordinary text is lossless and for something like CJK keeps the params
+    bounded.
+
+    DISCLOSURE NOTE
+    ---------------
+    The output is derived from the source data and embedding it in a spec
+    makes that spec carry source-derived statistics, exactly as a categorical
+    frequency vector does -- see ``docs/disclosure.md``. Character unigram
+    frequencies over a corpus are weak evidence about any individual record,
+    but a length histogram over a very small group is not nothing. This is
+    why the helper is opt-in rather than something profiling does on its own.
+    """
+    lengths: List[int] = []
+    chars: Counter = Counter()
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, float) and v != v:  # NaN
+            continue
+        s = str(v)
+        lengths.append(len(s))
+        chars.update(s)
+
+    params: Dict[str, Any] = {}
+    if not lengths:
+        return params
+
+    lo, hi = min(lengths), max(lengths)
+    params["min_length"] = lo
+    params["max_length"] = hi
+
+    counts = Counter(lengths)
+    if len(counts) <= length_bins:
+        ordered = sorted(counts)
+        total = float(sum(counts.values()))
+        params["length_values"] = ordered
+        params["length_weights"] = [counts[n] / total for n in ordered]
+    else:
+        edges, hist = _histogram(lengths, lo, hi, length_bins)
+        params["length_edges"] = edges
+        params["length_counts"] = hist
+
+    if chars:
+        common = chars.most_common(max_characters)
+        total = float(sum(c for _, c in common))
+        params["char_values"] = [ch for ch, _ in common]
+        params["char_weights"] = [c / total for _, c in common]
+
+    return params
+
+
+def _histogram(values: List[int], lo: int, hi: int,
+               bins: int) -> Tuple[List[float], List[float]]:
+    """Equal-width histogram over [lo, hi], without requiring numpy."""
+    if hi <= lo:
+        return [float(lo), float(lo + 1)], [float(len(values))]
+    width = (hi - lo) / bins
+    counts = [0.0] * bins
+    for v in values:
+        idx = int((v - lo) / width)
+        if idx >= bins:
+            idx = bins - 1
+        elif idx < 0:
+            idx = 0
+        counts[idx] += 1.0
+    edges = [lo + i * width for i in range(bins + 1)]
+    return edges, counts
 
 
 def _g_regex(ctx: GenContext) -> Any:

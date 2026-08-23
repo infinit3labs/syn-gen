@@ -66,17 +66,59 @@ See `examples/profiled_consumer_complaints.yaml` (profiled from the public
 CFPB consumer-finance-complaints dataset on HuggingFace) and its synthesized
 `examples/profiled_consumer_complaints_sample.parquet`.
 
-## Validating synthetic vs real data
-The `validate` module compares real and synthetic datasets **column by column**
-using statistical distances:
+## Evaluating synthetic data
+
+Three reports, answering three different questions. See
+**[docs/quality.md](docs/quality.md)** for the metric definitions and the
+SDMetrics dependency decision.
+
+| Command | Question | Output | Needs real data? |
+|---|---|---|---|
+| `syntab quality` | How closely does the synthetic data **resemble** the real data? | Graded, 0..1 | yes |
+| `syntab diagnose` | Is the synthetic data structurally **valid**? | Pass/fail | yes |
+| `syntab check` | Does the output honour its **Spec**? | Pass/fail | no |
+
+Fidelity is a matter of degree, so `quality` scores it rather than judging it.
+Structural validity is not — a category that does not exist in the source is
+simply wrong — so `diagnose` is pass/fail. Spec conformance is a third
+question, which is why it needs no source data and is not folded into either.
+
+```bash
+syntab quality  --real data.parquet --synthetic out.csv --verbose
+syntab quality  --real data.parquet --synthetic out.csv --min-score 0.8   # CI gate
+syntab diagnose --real data.parquet --synthetic out.csv --spec spec.yaml
+syntab check    --spec spec.yaml --data out/
+```
+
+```python
+from syntab import quality_report, diagnostic_report
+report = quality_report(real_df, synthetic_df, spec=spec)
+print(report.overall_score)
+print(report.to_text(verbose=True))
+```
+
+`quality` scores five properties — Column Shapes, **Column Pair Trends**,
+Coverage, Boundary Adherence and Missing Value Similarity — each a named
+SDMetrics metric (`github.com/sdv-dev/SDMetrics`). Column Pair Trends is
+the one that matters most here: a rule-based generator samples each column
+independently by construction, so it is exactly the kind of generator that can
+reproduce every marginal perfectly while destroying every relationship between
+columns. A marginals-only check cannot see that; this one can.
+
+### Per-column distances (`compare`)
+
+`syntab compare` remains as the quick per-column gate. It is **marginals only**
+— it says nothing about the relationships between columns, so a dataset can
+pass it with every correlation destroyed:
 
   * numeric / datetime → Kolmogorov–Smirnov statistic D (empirical-CDF supremum)
   * categorical / boolean → Total Variation Distance (0.5 · Σ|p − q|)
-  * text → structural distance (length stats + character-distribution TVD;
-    free text is *not* matched semantically, so it can only warn, never fail)
+  * text → structural distance (length statistics + character-distribution TVD)
 
-Each column gets a `pass` / `warn` / `fail` against configurable thresholds, and
-an overall verdict (free-text mismatches never hard-fail it).
+Each column gets a `pass` / `warn` / `fail` against configurable thresholds,
+and an overall verdict. Text columns are included in that verdict: length
+distribution and character frequency are structural properties, not semantic
+ones, and they are what a broken text generator gets wrong.
 
 ```bash
 # Python
@@ -104,8 +146,8 @@ A round-trip (`profile` → `generate` → `compare`) therefore matches real
 numeric distributions with low KS distance.
 
 ## Checking conformance to a Spec
-`compare` checks real-vs-synthetic *distributions*; `check` certifies that a
-generated (or real) dataset actually **obeys its Spec** — primary-key and
+`quality` and `compare` check synthetic data against *real data*; `check`
+certifies that a generated (or real) dataset actually **obeys its Spec** — primary-key and
 per-column uniqueness, not-null / `null_rate` constraints, foreign-key
 integrity, and every business rule (in-table *and* cross-join via parent
 aliases):
