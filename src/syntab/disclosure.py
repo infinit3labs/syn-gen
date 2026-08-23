@@ -84,6 +84,34 @@ class PiiDisclosure:
         return f"{self.table}.{self.column}"
 
 
+@dataclass(frozen=True)
+class DisclosureBudget:
+    """Optional release limits for disclosure metrics already in the report.
+
+    These are governance checks, not a differential-privacy guarantee. They
+    make a release decision explicit without pretending that counting fields
+    is equivalent to adding calibrated privacy noise.
+    """
+
+    max_unredacted_values: Optional[int] = None
+    max_rare_values: Optional[int] = None
+    max_conditional_cells: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        for name in ("max_unredacted_values", "max_rare_values",
+                     "max_conditional_cells"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+
+@dataclass(frozen=True)
+class DisclosureViolation:
+    metric: str
+    actual: int
+    limit: int
+
+
 @dataclass
 class DisclosureReport:
     """What a profiled Spec reveals about the data it was profiled from."""
@@ -156,6 +184,27 @@ class DisclosureReport:
         return bool(self.embedded_values or self.pii or self.key_candidates
                     or self.n_numeric_ranges or self.n_datetime_ranges
                     or self.n_string_shapes or self.conditionals)
+
+    def check_budget(self, budget: DisclosureBudget) -> List[DisclosureViolation]:
+        """Return the configured budget limits this report exceeds.
+
+        A missing limit means that metric is not governed by this budget. The
+        checks use report values after redaction/generalization, so a caller
+        can verify that those controls actually brought a spec within policy.
+        """
+        checks = (
+            ("unredacted categorical values", self.embedded_values,
+             budget.max_unredacted_values),
+            ("rare categorical values", self.rare_values,
+             budget.max_rare_values),
+            ("conditional cells", self.conditional_cells,
+             budget.max_conditional_cells),
+        )
+        return [
+            DisclosureViolation(metric, actual, limit)
+            for metric, actual, limit in checks
+            if limit is not None and actual > limit
+        ]
 
     # ---- construction ----------------------------------------------------
     @classmethod

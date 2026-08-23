@@ -12,6 +12,7 @@ round-trip). Built-in logic only; no external ML required.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -686,6 +687,13 @@ class DatasetProfiler:
         condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
         conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
     ):
+        self._validate_controls(
+            sample=sample,
+            max_categorical=max_categorical,
+            max_categorical_ratio=max_categorical_ratio,
+            max_categorical_ratio_cap=max_categorical_ratio_cap,
+            min_cell_count=min_cell_count,
+        )
         self.full = df
         self.name = name or "profiled"
         self.source = source or "unknown"
@@ -718,6 +726,31 @@ class DatasetProfiler:
         # column -> {real label: placeholder}, populated only when
         # --redact-categoricals is on. See _conditional_generation.
         self._redaction_maps: Dict[str, Dict[str, str]] = {}
+
+    @staticmethod
+    def _validate_controls(
+        *,
+        sample: Optional[int],
+        max_categorical: int,
+        max_categorical_ratio: float,
+        max_categorical_ratio_cap: int,
+        min_cell_count: int,
+    ) -> None:
+        """Reject profiling controls that would be invalid or unbounded."""
+        if sample is not None and (not isinstance(sample, int) or sample < 0):
+            raise ValueError("profiling control 'sample' must be non-negative or None")
+        if not isinstance(max_categorical, int) or max_categorical < 0:
+            raise ValueError("profiling control 'max_categorical' must be non-negative")
+        if not math.isfinite(max_categorical_ratio) or not 0 <= max_categorical_ratio <= 1:
+            raise ValueError(
+                "profiling control 'max_categorical_ratio' must be between 0 and 1"
+            )
+        if not isinstance(max_categorical_ratio_cap, int) or max_categorical_ratio_cap < 0:
+            raise ValueError(
+                "profiling control 'max_categorical_ratio_cap' must be non-negative"
+            )
+        if not isinstance(min_cell_count, int) or min_cell_count < 0:
+            raise ValueError("profiling control 'min_cell_count' must be non-negative")
 
     # ----- PII helpers -----
     #
@@ -803,7 +836,9 @@ class DatasetProfiler:
             description=f"Profiled from {self.source}",
             tags=["profiled"],
             source=f"profiled:{self.source}",
-            created_at=_dt.datetime.now(),
+            # A profile is a reproducible build artifact. Timestamps belong in
+            # the caller's run log, not in the serialized spec itself.
+            created_at=None,
         )
         return Spec(
             metadata=meta,
@@ -842,6 +877,20 @@ class DatasetProfiler:
         #
         # How much was actually read is provenance, so it is recorded
         # separately under ``metadata.profiling``. Nothing compares against it.
+        profiling_metadata = {
+            "source_row_count": source_rows,
+            "sampled_rows": n,
+            "sampled": n < source_rows,
+        }
+        if self.sample is not None:
+            profiling_metadata["requested_sample"] = self.sample
+        if self.seed is not None:
+            profiling_metadata["seed"] = self.seed
+        if self.identifying_key_candidates:
+            profiling_metadata["identifying_key_candidates"] = list(
+                self.identifying_key_candidates
+            )
+
         return TableSpec(
             name=name,
             row_count=source_rows,
@@ -850,19 +899,7 @@ class DatasetProfiler:
             columns=cols,
             unique_constraints=unique_constraints,
             metadata={
-                "profiling": {
-                    "source_row_count": source_rows,
-                    "sampled_rows": n,
-                    "sampled": n < source_rows,
-                    # id-like columns whose base name looks identifying
-                    # (patient_id). Not auto-flagged, because anonymizing a key
-                    # breaks PK/FK integrity -- recorded so the disclosure
-                    # summary can put them in front of a human. See
-                    # pii_name_signal.__doc__.
-                    **({"identifying_key_candidates":
-                        list(self.identifying_key_candidates)}
-                       if self.identifying_key_candidates else {}),
-                },
+                "profiling": profiling_metadata,
                 **({"discovery": {
                     **({"functional_dependencies": fds} if fds else {}),
                     **({"conditional_dependencies": conditionals}
@@ -937,7 +974,7 @@ class DatasetProfiler:
             description="Profiled from multiple related tables",
             tags=["profiled", "multi-table"],
             source=f"profiled:{list(tables)}",
-            created_at=_dt.datetime.now(),
+            created_at=None,
         )
         return Spec(
             metadata=meta,

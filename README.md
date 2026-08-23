@@ -1,11 +1,29 @@
 # syntab
 
-Spec-driven synthetic tabular/relational data generator for **testing and mocking**.
+Spec-driven synthetic tabular and relational data for testing, fixtures, and
+mock environments.
 
-A **Spec** (defined as pydantic models) is the single contract: author it by hand
-to generate data, or emit it from a future profiling module to re-synthesize a
-compatible dataset. The profiler round-trip uses `generator: auto` + embedded
-`profile` statistics.
+syntab uses a versionable **Spec** as the contract for generated data. Write a
+Spec by hand for deterministic test data, or profile an existing dataset and
+round-trip the resulting `generator: auto` specification. The engine preserves
+table relationships, dependencies, business rules, and useful distributional
+properties without copying source rows into the generated output.
+
+> syntab is early-stage software. Review generated data and profiled Specs
+> before using them outside a development or test environment.
+
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Library](#library)
+- [CLI](#cli)
+- [Profiling and evaluation](#profiling-an-existing-dataset)
+- [Disclosure and privacy](#disclosure-posture-read-before-committing-a-profiled-spec)
+- [Examples and documentation](#examples-and-documentation)
+- [Development](#development)
+- [License](#license)
 
 ## Features
 - **Relational**: foreign keys with referential integrity (`relationships` + `fk`/`alias`).
@@ -25,12 +43,43 @@ compatible dataset. The profiler round-trip uses `generator: auto` + embedded
 - **Outputs**: CSV / JSON / JSONL / Parquet / SQL. Both a **library** and a **CLI**.
 
 ## Install
+
+For local development, clone the repository and install it in editable mode:
+
 ```bash
+git clone https://github.com/infinit3labs/syn-gen.git
+cd syn-gen
 pip install -e .
 pip install -e ".[parquet,dev]"   # optional parquet + dev deps
 pip install -e ".[discovery]"     # key / foreign-key / dependency discovery
                                   # (AGPL-3.0-only, Linux + macOS wheels only)
 ```
+
+The core package does not require the optional discovery extra. Install only
+the extras needed for your workflow; `parquet` adds PyArrow and `discovery`
+adds Desbordante-based dependency discovery.
+
+## Quick start
+
+Generate a small relational dataset from the committed example Spec:
+
+```bash
+syntab generate \
+  --spec examples/demos/02_basic_relational.yaml \
+  --out ./output/basic-relational \
+  --format csv
+```
+
+Validate the generated files against the same Spec:
+
+```bash
+syntab check \
+  --spec examples/demos/02_basic_relational.yaml \
+  --data ./output/basic-relational
+```
+
+The `output/` directory is ignored by Git, so local runs do not add generated
+datasets to a checkout.
 
 ## Library
 ```python
@@ -300,11 +349,14 @@ current table plus the parents it still needs, instead of the whole dataset:
 ```bash
 syntab generate --spec spec.yaml --out big_out/ --stream          # csv
 syntab generate --spec spec.yaml --out big_out/ --stream --format jsonl
+syntab generate --spec spec.yaml --out big_out/ --stream --chunk-size 10000
 ```
 
 Programmatic sinks (`formats.CSVSink`, `formats.JSONLSink`, or any object with
 a `write_table(name, rows)` method) can be passed to
-`GenerationEngine.run(stream_sink=...)`.
+`GenerationEngine.run(stream_sink=..., chunk_size=10000)`. A supplied
+`progress(table, emitted, total)` callback runs after each successful write;
+generation errors propagate and previously written chunks remain on disk.
 
 ## Conditional generation
 
@@ -536,6 +588,24 @@ contains field by field, what the controls do, the known residual risks
 See `examples/spec.yaml` (hand-authored) and `examples/spec_profiled.json`
 (profiler-style, with `profile` stats and `generator: auto`).
 
+## Examples and documentation
+
+The repository is intentionally organized around the public workflow:
+
+| Path | Purpose |
+|---|---|
+| `src/syntab/` | Installable Python package and CLI implementation |
+| `tests/` | Automated behavior and regression tests |
+| `examples/demos/` | Small, progressive Specs covering common features |
+| `examples/mock_specs/` | End-to-end relational and business-rule demos |
+| `docs/discovery.md` | Optional dependency and relationship discovery |
+| `docs/quality.md` | Fidelity, validity, and conformance reports |
+| `docs/disclosure.md` | What profiling records and how to review it safely |
+
+Start with the [basic demo](examples/demos/01_basic_single_table.yaml), then
+read the [demo guide](examples/demos/README.md). The longer sections below are
+reference material for advanced Specs and production-shaped test fixtures.
+
 ## Mock specs (rules, constraints, key consistency)
 `examples/mock_specs/` demonstrates the business-rule DSL and constraint system
 end to end, with a verification runner that asserts every declared constraint
@@ -556,6 +626,29 @@ python examples/mock_specs/run_demo.py
 
 
 ## Development
+
+Install the development dependencies and run the full test suite:
+
 ```bash
+python -m pip install -e ".[parquet,dev]"
 pytest
 ```
+
+Run a focused test while iterating:
+
+```bash
+pytest tests/test_engine.py -q
+```
+
+Please keep real datasets, profiler output, credentials, and generated output
+out of commits. The repository's [`.gitignore`](.gitignore) intentionally
+ignores common tabular formats and derived profiler artifacts; see the
+[disclosure guide](docs/disclosure.md) before sharing a profiled Spec.
+
+Contribution expectations and the local verification commands are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+syntab is released under the [MIT License](LICENSE), allowing use,
+modification, distribution, and commercial use subject to its terms.

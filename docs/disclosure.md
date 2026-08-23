@@ -228,6 +228,24 @@ Name matching is on **name tokens**, not substrings, so `home_address` and
 
 ## 4. Known limits — read this part
 
+### Optional disclosure budgets
+
+The profiler can enforce simple release budgets over the disclosure report:
+
+```bash
+syntab profile data.csv --out spec.yaml \
+  --redact-categoricals --min-cell-count 5 \
+  --max-unredacted-values 0 --max-rare-values 0
+```
+
+When a configured limit is exceeded, profiling fails before writing the spec.
+The limits cover unredacted categorical labels, remaining rare categorical
+values, and conditional-table cells (`--max-conditional-cells`). These are
+governance checks over the artefact's measured disclosure surface, not a
+differential-privacy budget or a formal anonymity guarantee. Differential
+privacy requires calibrated noise and a separate accounting model, which
+syntab does not currently provide.
+
 These are residual risks the controls above do **not** cover.
 
 1. **Id-like columns are never auto-flagged.** A trailing `id`/`uuid`/`guid`

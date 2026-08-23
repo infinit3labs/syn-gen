@@ -7,6 +7,7 @@ name = "syntab"
 version = "0.1.0"
 description = "Spec-driven synthetic tabular/relational data generator with custom generators, a business-rule DSL, and profiling-ready Specs."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
     "pydantic>=2.0",

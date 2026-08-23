@@ -12,7 +12,7 @@ import pandas as pd
 from . import formats
 from . import generators
 from . import quality
-from .disclosure import DisclosureReport
+from .disclosure import DisclosureBudget, DisclosureReport
 from .engine import GenerationEngine, SpecError
 from .loaders import from_file, spec_to_dict, to_file
 from .profiler import (
@@ -45,12 +45,14 @@ def cli() -> None:
 @click.option("--stream", is_flag=True,
               help="Stream tables to disk as they are generated (csv/jsonl "
                    "directory output; lower memory for large datasets).")
+@click.option("--chunk-size", default=None, type=int,
+              help="Rows per streamed sink write. Defaults to one write per table.")
 @click.option("--vectorized", is_flag=True,
               help="Use the column-wise fast path where possible (tables with "
                    "rules/dependencies/Faker/self-refs/M2M/uniqueness fall back "
                    "to row-by-row generation).")
 def generate(spec_path: str, out: str, fmt: str | None, seed: int | None,
-             stream: bool, vectorized: bool) -> None:
+             stream: bool, chunk_size: int | None, vectorized: bool) -> None:
     """Generate data from a Spec."""
     spec = from_file(spec_path)
     if seed is not None:
@@ -63,7 +65,7 @@ def generate(spec_path: str, out: str, fmt: str | None, seed: int | None,
                 click.echo("Error: --stream only supports csv or jsonl.", err=True)
                 sys.exit(2)
             sink = formats.CSVSink(out) if eff_fmt == "csv" else formats.JSONLSink(out)
-            engine.run(stream_sink=sink, vectorized=vectorized)
+            engine.run(stream_sink=sink, vectorized=vectorized, chunk_size=chunk_size)
             sink.close()
             total = sum(t.row_count for t in spec.tables)
             click.echo(f"Streamed {total} rows across {len(spec.tables)} table(s) to {out}")
@@ -188,6 +190,15 @@ def validate(spec_path: str) -> None:
                    "derived from the source data. Use when the spec will be "
                    "committed or shared and the category labels themselves "
                    "are sensitive.")
+@click.option("--max-unredacted-values", type=click.IntRange(min=0),
+              default=None, help="Fail before writing when the disclosure "
+              "report contains more unredacted categorical values than this.")
+@click.option("--max-rare-values", type=click.IntRange(min=0), default=None,
+              help="Fail before writing when more rare categorical values "
+              "remain than this budget allows.")
+@click.option("--max-conditional-cells", type=click.IntRange(min=0),
+              default=None, help="Fail before writing when the disclosure "
+              "report contains more conditional cells than this.")
 @click.option("--pii", "pii", default=None,
               help="Comma-separated column names to treat as PII.")
 @click.option("--pii-strategy", "pii_strategy", default="faker",
@@ -257,6 +268,8 @@ def validate(spec_path: str) -> None:
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             max_categorical: int, max_categorical_ratio: float,
             min_cell_count: int, redact_categoricals: bool,
+            max_unredacted_values: int, max_rare_values: int,
+            max_conditional_cells: int,
             pii: str, pii_strategy: str, discover, discover_fds: bool,
             condition_on_fds: bool, conditional_fd_error: float,
             fd_error: float, fd_min_mu: float, ind_error: float,
@@ -305,6 +318,20 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     if merge_into:
         from .profiler import merge_preserving_edits
         spec = merge_preserving_edits(from_file(merge_into), spec)
+    report = DisclosureReport.from_spec(spec)
+    violations = report.check_budget(DisclosureBudget(
+        max_unredacted_values=max_unredacted_values,
+        max_rare_values=max_rare_values,
+        max_conditional_cells=max_conditional_cells,
+    ))
+    if violations:
+        details = "; ".join(
+            f"{v.metric}={v.actual} exceeds budget {v.limit}"
+            for v in violations
+        )
+        raise click.ClickException(
+            f"disclosure budget exceeded; no spec written: {details}"
+        )
     to_file(spec, out)
     n_rel = sum(len(t.relationships) for t in spec.tables)
     n_pii = sum(1 for t in spec.tables for c in t.columns if c.pii)
@@ -356,7 +383,7 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     # the artefact rather than part of it, and stderr is the stream that
     # survives `syntab profile ... | tee`, redirection and CI log capture -- the
     # situations in which someone is least likely to be reading closely.
-    click.echo(DisclosureReport.from_spec(spec).to_text(spec_path=out), err=True)
+    click.echo(report.to_text(spec_path=out), err=True)
 
 
 def _read_any(path: str) -> pd.DataFrame:

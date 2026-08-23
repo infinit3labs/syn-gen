@@ -11,7 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from syntab.cli import cli
-from syntab.disclosure import DisclosureReport
+from syntab.disclosure import DisclosureBudget, DisclosureReport
 from syntab.profiler import RECOMMENDED_MIN_CELL_COUNT, DatasetProfiler
 
 SEED = 3
@@ -153,6 +153,35 @@ def test_notice_says_the_spec_is_derived_data_and_must_be_reviewed():
     assert "not automatically" in text and "anonymous" in text
 
 
+def test_disclosure_budget_reports_only_exceeded_limits():
+    rep = _report()
+    budget = DisclosureBudget(max_unredacted_values=10, max_rare_values=0)
+
+    violations = rep.check_budget(budget)
+
+    assert [v.metric for v in violations] == [
+        "unredacted categorical values", "rare categorical values"
+    ]
+    assert violations[0].actual == 25
+    assert violations[0].limit == 10
+    assert violations[1].actual == 20
+    assert violations[1].limit == 0
+
+
+def test_disclosure_budget_accepts_redaction_and_suppression():
+    rep = _report(min_cell_count=RECOMMENDED_MIN_CELL_COUNT,
+                  redact_categoricals=True)
+
+    assert rep.check_budget(DisclosureBudget(
+        max_unredacted_values=0, max_rare_values=0,
+        max_conditional_cells=0)) == []
+
+
+def test_disclosure_budget_rejects_negative_limits():
+    with pytest.raises(ValueError, match="non-negative"):
+        DisclosureBudget(max_rare_values=-1)
+
+
 # ---------------------------------------------------------------------------
 # it actually reaches the user
 # ---------------------------------------------------------------------------
@@ -178,3 +207,17 @@ def test_notice_goes_to_stderr_so_it_survives_redirection(tmp_path):
     assert res.exit_code == 0
     assert "DISCLOSURE NOTICE" in res.stderr
     assert "DISCLOSURE NOTICE" not in res.stdout
+
+
+def test_profile_cli_enforces_disclosure_budget_before_writing(tmp_path):
+    data = tmp_path / "d.csv"
+    _clinic().to_csv(data, index=False)
+    out = tmp_path / "s.yaml"
+    res = CliRunner().invoke(cli, [
+        "profile", str(data), "--out", str(out),
+        "--max-unredacted-values", "10",
+    ])
+
+    assert res.exit_code != 0
+    assert "disclosure budget exceeded" in res.output
+    assert not out.exists()

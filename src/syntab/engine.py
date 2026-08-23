@@ -725,7 +725,17 @@ class GenerationEngine:
                                 f"in {t.name}.{c.name}"
                             )
 
-    def run(self, stream_sink: Any = None, vectorized: bool = False) -> GenerationResult:
+    def run(self, stream_sink: Any = None, vectorized: bool = False,
+            chunk_size: Optional[int] = None,
+            progress: Optional[Callable[[str, int, int], None]] = None) -> GenerationResult:
+        """Generate tables, optionally writing streamed output in chunks.
+
+        ``progress`` receives ``(table_name, emitted, table_total)`` after
+        each successful sink write. Exceptions propagate so prior chunks stay
+        available to the caller.
+        """
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
         spec = self.spec
         seed = spec.settings.seed
         rng = __import__("random").Random(seed)
@@ -861,14 +871,29 @@ class GenerationEngine:
                 )
 
             rows: List[Dict[str, Any]] = []
+            stream_buffer: List[Dict[str, Any]] = []
+            emitted = 0
+            ordered_table = any(rel.ordered and rel.order_column for rel in table.relationships)
             attempts_total = spec.settings.max_rule_attempts
             fallback = spec.settings.fallback
 
-            if vectorized and _can_vectorize(table):
+            def emit_chunk(chunk: List[Dict[str, Any]]) -> None:
+                nonlocal emitted
+                if stream_sink is None or not chunk:
+                    return
+                stream_sink.write_table(table.name, chunk)
+                emitted += len(chunk)
+                if progress is not None:
+                    progress(table.name, emitted, table.row_count)
+
+            used_vectorized = vectorized and _can_vectorize(table)
+            if used_vectorized:
                 rows = _build_table_vectorized(
                     self, table, col_order, fk_cols, fk_rows, parent_selectors,
                     rng, rng_np, table.row_count,
                 )
+                if stream_sink is not None and chunk_size is not None and not ordered_table:
+                    stream_buffer.extend(rows)
             else:
                 for i in range(table.row_count):
                     if m2m is not None:
@@ -909,6 +934,11 @@ class GenerationEngine:
                             )
                     # commit sequence increments + unique values already added per accepted row
                     rows.append(row)
+                    if stream_sink is not None and chunk_size is not None and not ordered_table:
+                        stream_buffer.append(row)
+                        if len(stream_buffer) >= chunk_size:
+                            emit_chunk(stream_buffer)
+                            stream_buffer = []
                     for rel in self_refs:
                         alias = rel.alias or rel.parent_table
                         pool = self_ref_pool[alias]
@@ -935,15 +965,22 @@ class GenerationEngine:
                         rows, rel.child_columns, rel.order_column
                     )
 
+            if stream_sink is not None:
+                if chunk_size is None:
+                    emit_chunk(rows)
+                elif ordered_table:
+                    # Ordering is a post-processing step, so defer all writes
+                    # for this table until the final order is known.
+                    for start in range(0, len(rows), chunk_size):
+                        emit_chunk(rows[start:start + chunk_size])
+                elif stream_buffer:
+                    emit_chunk(stream_buffer)
+
             fk_rows[table.name] = rows
             for c in table.columns:
                 fk_index[f"{table.name}.{c.name}"] = [r.get(c.name) for r in rows]
 
-            if stream_sink is not None:
-                # streaming mode: write this table to the sink; do not keep it
-                # in memory (only parents still needed by later tables remain).
-                stream_sink.write_table(table.name, rows)
-            else:
+            if stream_sink is None:
                 out[table.name] = rows
             columns[table.name] = [c.name for c in table.columns]
 
