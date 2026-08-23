@@ -80,7 +80,14 @@ Minimum cell-size suppression. Categorical values occurring fewer than K times
 frequency mass is preserved, so generation is unaffected in aggregate.
 
 ```bash
+# K=5 is the default, so this is suppression on:
+syntab profile data.parquet --out spec.yaml
+
+# the same thing said explicitly:
 syntab profile data.parquet --out spec.yaml --min-cell-count 5
+
+# and the opt-out, which writes the rare values into the spec:
+syntab profile data.parquet --out spec.yaml --min-cell-count 0
 ```
 
 ```yaml
@@ -104,13 +111,31 @@ Two details that matter:
   cells it absorbed — a bucket of one is the value it hid. syntab keeps
   absorbing the smallest surviving category until the bucket clears K.
 
-**The default is `0`, i.e. off.** This is deliberate and it is a decision you
-may want to override in your own workflows. Enabling it by default would
-silently change the statistical content of every profile, and how much
-disclosure risk is acceptable belongs to whoever holds the data. Instead, the
-disclosure summary reports how many embedded values fall below the recommended
-threshold of 5 **whether or not you passed the flag**, so the decision is put
-in front of you rather than made for you.
+**The default is `5`, i.e. on.** This is deliberate, and it reverses an
+earlier default of `0`. Pass `--min-cell-count 0` to turn suppression off and
+profile at full fidelity; that is a supported, documented choice, and the
+disclosure summary will record that you made it.
+
+The default changed for two reasons.
+
+*The errors are not symmetric.* Suppressing when you did not need to costs
+fidelity, and the disclosure summary tells you loudly enough to change it.
+Publishing when you should not have writes the identifying values into a file
+that is then committed, copied and shared. Only one of those is retractable.
+
+*A spec now carries much more than it did.* When the default was first chosen a
+spec held marginal frequency vectors — which values exist, and how often. It
+now also holds conditional tables recording which values **co-occur**, so the
+unit at risk is a contingency-table cell rather than a marginal value, and
+there are one to two orders of magnitude more of them. On the reference
+dataset, the same `K=5` suppresses **61 conditional cells** against **2
+marginal values** — roughly thirty times as much exposure sitting behind the
+same switch. A control that was thin cover when it was off by default is no
+cover at all at that scale.
+
+The disclosure summary still reports how many embedded values fall below the
+recommended threshold of 5 **whether or not suppression ran**, so the decision
+stays visible either way.
 
 ### `--redact-categoricals`
 

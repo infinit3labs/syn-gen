@@ -109,19 +109,22 @@ _ID_TOKENS = {"id", "uuid", "guid"}
 # Fidelity and disclosure risk trade against each other. This is a control on
 # that trade, not a proof of anything.
 
-# Suppression is OFF by default. See DatasetProfiler._categorical_profile for
-# why, and note that the disclosure summary reports how many values fall below
-# RECOMMENDED_MIN_CELL_COUNT whether or not suppression is enabled.
-DEFAULT_MIN_CELL_COUNT = 0
-
-# The threshold to reach for when you do enable it, and the one the disclosure
-# summary measures against. Five is the most widely used minimum cell size in
+# The threshold suppression reaches for, and the one the disclosure summary
+# measures against. Five is the most widely used minimum cell size in
 # published SDC practice -- it is the common floor in national statistical
 # office rules and in health-data release policy (CMS uses a stricter 11 for
 # Medicare claims, some agencies use 3). There is no principled universal
 # value: K is a policy decision about acceptable risk, and this constant is a
 # default for that decision, not a substitute for it.
 RECOMMENDED_MIN_CELL_COUNT = 5
+
+# Suppression is ON by default, at the recommended threshold. The protective
+# setting is the one that should apply when nobody has expressed a preference,
+# because the cost of the wrong default is asymmetric: suppressing by mistake
+# loses fidelity, publishing by mistake loses it irreversibly. See
+# DatasetProfiler._categorical_profile for the full argument, and
+# --min-cell-count 0 for the explicit opt-out.
+DEFAULT_MIN_CELL_COUNT = RECOMMENDED_MIN_CELL_COUNT
 
 # Label for the residual bucket. Deliberately not a plausible real value, so
 # nobody mistakes it for one when reading a spec.
@@ -1514,14 +1517,30 @@ class DatasetProfiler:
         that is existing behaviour and out of scope here -- so the emitted
         vector is unchanged when suppression is off.
 
-        SUPPRESSION IS OFF BY DEFAULT (DEFAULT_MIN_CELL_COUNT = 0). Turning it
-        on by default would silently change the statistical content of every
-        profile -- a 5-row test frame would collapse entirely at K=5 -- and
-        suppression is a policy decision belonging to whoever holds the data,
-        not a default a library should make on their behalf. The answer to
-        "then nobody will use it" is not a coerced default; it is the
-        disclosure summary, which reports how many embedded values fall below
-        RECOMMENDED_MIN_CELL_COUNT whether or not the flag was passed.
+        SUPPRESSION IS ON BY DEFAULT, at RECOMMENDED_MIN_CELL_COUNT. This
+        reverses the original default of 0, and the reversal is deliberate.
+
+        The earlier argument was that suppression changes the statistical
+        content of a profile and so belongs to whoever holds the data. That is
+        still true of the *threshold*, which is why K remains a flag. It is not
+        a good argument for the *default*, for two reasons.
+
+        First, the errors are not symmetric. Defaulting to suppression and
+        being wrong costs fidelity, and the disclosure summary says so loudly
+        enough to correct. Defaulting to publication and being wrong emits the
+        identifying values into a file that then gets committed and shared, and
+        that is not retractable.
+
+        Second, a spec now carries far more than it did when this default was
+        chosen. Conditional generation records which values CO-OCCUR, so the
+        unit at risk is a contingency-table cell, not a marginal value, and
+        there are one to two orders of magnitude more of them. On the
+        reference dataset the same K=5 suppresses 61 conditional cells against
+        2 marginal values. An off-by-default control that was already thin
+        cover for marginals is no cover at all for that.
+
+        --min-cell-count 0 remains a working, documented opt-out, so full
+        fidelity is one flag away for whoever holds the data and wants it.
         """
         counts = vals.value_counts()
         # _is_categorical already bounds n_unique; head() is a belt-and-braces
