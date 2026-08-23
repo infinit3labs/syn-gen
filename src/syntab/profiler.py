@@ -238,6 +238,32 @@ DEFAULT_DISCOVER_FDS = False
 # table can yield hundreds; a spec is something a human reads and edits.
 MAX_RECORDED_FDS = 50
 
+# Conditional generation: turning a discovered dependency into an instruction
+# to generation rather than a line in a report.
+#
+# This is the half of dependency discovery that was missing. Discovery found
+# that Sub-product determines Product on the CFPB source and recorded it;
+# generation then sampled the two columns independently and the hierarchy came
+# out destroyed -- 0.16 on the pair against 0.98 and 0.96 on the marginals.
+# When this is on, a column on the receiving end of a selected dependency is
+# generated with the ``conditional`` generator, drawing from the observed
+# P(dependent | determinant) instead of from its own marginal.
+#
+# ON by default when --discover-fds is on, and only then. Discovering FDs is
+# already an explicit request that costs real time; having made it, the useful
+# thing to do with the answer is act on it. Someone who wants the report
+# without the behaviour change passes --no-condition-on-fds.
+DEFAULT_CONDITION_ON_FDS = True
+
+# Widest determinant a conditional generator will be given. One, and the
+# reason is disclosure as much as file size: a conditional table over a
+# k-column determinant records the joint frequency of every observed
+# (x1..xk, y) combination, which for k >= 2 approaches publishing the source
+# contingency table itself. One determinant keeps it at O(|X| * |Y|) -- the
+# same order as the two marginals it replaces -- and on real hierarchies it is
+# where almost all of the fidelity is.
+MAX_CONDITIONAL_LHS = 1
+
 
 # Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
 DEFAULT_MAX_CATEGORICAL = 50
@@ -657,6 +683,8 @@ class DatasetProfiler:
         ind_error: float = discovery.DEFAULT_IND_ERROR,
         discovery_sample_rows: int = discovery.DEFAULT_SAMPLE_ROWS,
         discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
+        condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
+        conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
     ):
         self.full = df
         self.name = name or "profiled"
@@ -681,9 +709,15 @@ class DatasetProfiler:
         self.ind_error = ind_error
         self.discovery_sample_rows = discovery_sample_rows
         self.discovery_max_lhs = discovery_max_lhs
+        # Conditioning is only meaningful when FDs were actually discovered.
+        self.condition_on_fds = bool(condition_on_fds) and self.discover_fds
+        self.conditional_fd_error = conditional_fd_error
         # id-like columns whose base name looks identifying (patient_id). Not
         # auto-flagged -- see pii_name_signal -- but surfaced for review.
         self.identifying_key_candidates: List[str] = []
+        # column -> {real label: placeholder}, populated only when
+        # --redact-categoricals is on. See _conditional_generation.
+        self._redaction_maps: Dict[str, Dict[str, str]] = {}
 
     # ----- PII helpers -----
     #
@@ -798,6 +832,7 @@ class DatasetProfiler:
         pk, key_prov = self._detect_pk(cols, uccs, source_rows)
         unique_constraints = self._composite_unique_constraints(uccs, pk)
         fds = self._discover_fds(df)
+        conditionals = self._apply_conditional_generation(df, cols, pk)
         # ``row_count`` is the size of the SOURCE dataset, not of whatever
         # sample we happened to read. It is the contract "a dataset of this
         # shape has this many rows", and ``syntab check`` compares generated
@@ -828,8 +863,11 @@ class DatasetProfiler:
                         list(self.identifying_key_candidates)}
                        if self.identifying_key_candidates else {}),
                 },
-                **({"discovery": {"functional_dependencies": fds}}
-                   if fds else {}),
+                **({"discovery": {
+                    **({"functional_dependencies": fds} if fds else {}),
+                    **({"conditional_dependencies": conditionals}
+                       if conditionals else {}),
+                }} if (fds or conditionals) else {}),
             },
         )
 
@@ -854,6 +892,8 @@ class DatasetProfiler:
         ind_error: float = discovery.DEFAULT_IND_ERROR,
         discovery_sample_rows: int = discovery.DEFAULT_SAMPLE_ROWS,
         discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
+        condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
+        conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
     ) -> Spec:
         """Profile several related tables and discover foreign keys.
 
@@ -875,7 +915,9 @@ class DatasetProfiler:
                    fd_error=fd_error, fd_min_mu=fd_min_mu,
                    ind_error=ind_error,
                    discovery_sample_rows=discovery_sample_rows,
-                   discovery_max_lhs=discovery_max_lhs)
+                   discovery_max_lhs=discovery_max_lhs,
+                   condition_on_fds=condition_on_fds,
+                   conditional_fd_error=conditional_fd_error)
             for t, df in tables.items()
         }
         table_specs = {
@@ -1290,7 +1332,7 @@ class DatasetProfiler:
         n_nulls = int(stats_src.isna().sum())
         null_rate = round(n_nulls / total, 4) if total else 1.0
 
-        dtype, profile = self._infer_type_and_profile(s, full=full)
+        dtype, profile = self._infer_type_and_profile(s, full=full, column=name)
         params: dict = {}
         constraints: dict = {"nullable": n_nulls > 0, "null_rate": null_rate}
 
@@ -1367,6 +1409,7 @@ class DatasetProfiler:
 
     def _infer_type_and_profile(
         self, s: pd.Series, full: Optional[pd.Series] = None,
+        column: Optional[str] = None,
     ) -> Tuple[str, Optional[ColumnProfile]]:
         if pd.api.types.is_bool_dtype(s.dtype):
             return "bool", None
@@ -1403,7 +1446,8 @@ class DatasetProfiler:
             full_vals = (full.dropna().astype(str)
                          if full is not None else None)
             return "str", ColumnProfile(
-                categorical=self._categorical_profile(vals, full_vals)
+                categorical=self._categorical_profile(vals, full_vals,
+                                                      column=column)
             )
 
         # free text: length stats (+ pattern if short)
@@ -1415,6 +1459,7 @@ class DatasetProfiler:
 
     def _categorical_profile(
         self, vals: pd.Series, full_vals: Optional[pd.Series] = None,
+        column: Optional[str] = None,
     ) -> CategoricalProfile:
         """Build the categorical profile for a column, applying disclosure controls.
 
@@ -1468,8 +1513,16 @@ class DatasetProfiler:
 
         redacted = False
         if self.redact_categoricals:
+            real_labels = list(values)
             values = _redact_categorical_values(values)
             redacted = True
+            # The label -> placeholder mapping, kept in memory only, so that a
+            # conditional table built later can be expressed in the SAME
+            # placeholder vocabulary instead of reintroducing the real labels
+            # this flag exists to remove. It is never written anywhere.
+            if column is not None:
+                self._redaction_maps[column] = dict(
+                    zip(real_labels, values.keys()))
 
         return CategoricalProfile(
             values=values, null_rate=0.0, redacted=redacted,
@@ -1636,6 +1689,186 @@ class DatasetProfiler:
         found.sort(key=lambda f: (-(f.mu_prime or 1.0), len(f.determinant),
                                   f.determinant, f.dependent))
         return [f.as_dict() for f in found[:MAX_RECORDED_FDS]]
+
+    # ----- conditional generation -------------------------------------------
+
+    def _conditional_candidates(self, df: pd.DataFrame) -> List[Any]:
+        """Discover the dependencies that conditioning may draw on.
+
+        A SECOND, NARROWER PASS rather than a reuse of ``_discover_fds``.
+        Reporting an FD and conditioning on one answer different questions and
+        take different thresholds -- see
+        ``discovery.DEFAULT_CONDITIONAL_FD_ERROR`` -- and running the two
+        separately means turning conditioning on cannot change a single line of
+        what ``metadata.discovery.functional_dependencies`` reports. The
+        report stays a report. It costs one extra Pyro run, bounded to
+        single-column determinants: about 5 s on the 208k-row CFPB source
+        against the 21 s the rest of profiling takes.
+        """
+        if not self.condition_on_fds:
+            return []
+        try:
+            return discovery.discover_functional_dependencies(
+                df,
+                error=max(self.fd_error, self.conditional_fd_error),
+                min_mu=self.fd_min_mu,
+                max_lhs=MAX_CONDITIONAL_LHS,
+                sample_rows=self.discovery_sample_rows,
+                seed=self.seed,
+            )
+        except discovery.DiscoveryUnavailable:
+            return []
+
+    def _conditionally_generable(self, col: ColumnSpec, pk: Any) -> bool:
+        """Whether a column may sit on either end of a conditional edge.
+
+        Categorical, because a conditional table over a continuous or free-text
+        column is a table of the data itself. Not PII, because the whole point
+        of flagging PII is that no real value or real structure of it reaches
+        the spec. Not a key, because a key is generated to be unique and
+        conditioning it on anything would fight that.
+        """
+        if col.pii:
+            return False
+        if col.constraints.get("unique"):
+            return False
+        keys = [pk] if isinstance(pk, str) else list(pk or [])
+        if col.name in keys:
+            return False
+        prof = col.profile
+        return bool(prof and prof.categorical and prof.categorical.values)
+
+    def _apply_conditional_generation(
+        self, df: pd.DataFrame, cols: List[ColumnSpec], pk: Any,
+    ) -> List[Dict[str, Any]]:
+        """Turn selected dependencies into ``conditional`` generators, in place.
+
+        This is the step that closes the loop. Until now the profiler
+        discovered that Sub-product determines Product and wrote it into a
+        metadata dict that nothing read; generation then sampled the two
+        columns independently and produced a Product/Sub-product pair scoring
+        0.16 against real data whose marginals scored 0.98 and 0.96.
+
+        Returns the edges it applied, for ``metadata.discovery``.
+        """
+        candidates = self._conditional_candidates(df)
+        if not candidates:
+            return []
+
+        by_name = {c.name: c for c in cols}
+        eligible = [c.name for c in cols
+                    if self._conditionally_generable(c, pk)]
+        edges = discovery.choose_dependency_forest(candidates, eligible)
+
+        applied: List[Dict[str, Any]] = []
+        for edge in edges:
+            dependent = by_name.get(edge.dependent)
+            determinant = by_name.get(edge.determinant)
+            if dependent is None or determinant is None:
+                continue
+            params = self._conditional_params(df, edge.determinant,
+                                              edge.dependent)
+            if params is None:
+                continue
+            dependent.generator = "conditional"
+            dependent.params = params
+            if edge.determinant not in dependent.depends_on:
+                dependent.depends_on = list(dependent.depends_on) + [
+                    edge.determinant]
+            applied.append(edge.as_dict())
+        return applied
+
+    def _conditional_params(
+        self, df: pd.DataFrame, determinant: str, dependent: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Empirical P(dependent | determinant), in the vocabulary of the spec.
+
+        Three alignments have to hold or the conditional silently degrades to
+        the fallback marginal, which would look like it worked:
+
+        LABELS. The categorical profile stores ``str(value)`` labels drawn
+        from the SAMPLE. Generation can only ever emit those labels, so the
+        conditional table is restricted to them; a full-data value the sample
+        never saw is unreachable and only inflates the file.
+
+        NULLS. A null determinant is a key like any other -- 18.8% of CFPB
+        Sub-product is null and those rows still have a Product. A null
+        DEPENDENT is carried as a value inside the conditional distribution,
+        which is why ``engine`` does not also inject nulls at the column's
+        marginal ``null_rate`` for a conditional column: P(NULL | X) varies
+        enormously by X (some CFPB Issues have no sub-issue at all) and one
+        marginal rate applied uniformly would put the missingness in the wrong
+        rows and take the pair-trend score down with it.
+
+        REDACTION. Under --redact-categoricals both sides are translated into
+        the same placeholder vocabulary the marginals use, so the conditional
+        table introduces no real label. See the disclosure note below.
+
+        CELL COUNTS. --min-cell-count is applied per determinant group, using
+        the conditional cell count. This is stricter than applying it to the
+        marginals, and deliberately so: a conditional cell is a smaller group
+        than a marginal cell by construction, so the suppression matters more
+        here, not less.
+
+        DISCLOSURE NOTE
+        ---------------
+        A conditional table embeds strictly more of the source than the two
+        marginals it replaces: which combinations co-occur, and in what
+        proportion. See ``docs/disclosure.md``.
+        """
+        from .generators import conditional_params
+
+        det_ok, det_map = self._label_map(determinant)
+        dep_ok, dep_map = self._label_map(dependent)
+        if not det_ok or not dep_ok:
+            return None
+
+        det_raw, dep_raw = df[determinant], df[dependent]
+        det_labels = self._as_spec_labels(det_raw, det_map)
+        dep_labels = self._as_spec_labels(dep_raw, dep_map)
+
+        # A value with no label in the emitted vocabulary can never be
+        # generated (determinant) or must never be generated (dependent), so
+        # its rows say nothing about what generation will do. Only reachable
+        # under redaction, where the vocabulary is a fixed placeholder set.
+        keep = (det_raw.isna() | det_labels.notna()) & (
+            dep_raw.isna() | dep_labels.notna())
+        if not bool(keep.any()):
+            return None
+
+        frame = pd.DataFrame({
+            determinant: det_labels[keep],
+            dependent: dep_labels[keep],
+        })
+        return conditional_params(
+            frame, [determinant], dependent,
+            min_cell_count=self.min_cell_count,
+            other_label=OTHER_BUCKET_LABEL,
+        )
+
+    def _label_map(self, column: str) -> Tuple[bool, Optional[Dict[str, str]]]:
+        """``(usable, mapping)`` for translating real values into spec labels.
+
+        ``mapping is None`` means identity -- the spec carries the real labels,
+        so no translation is needed. Under --redact-categoricals the mapping is
+        the placeholder vocabulary recorded when the marginal was built, and a
+        column that has none cannot take part in a conditional at all.
+        """
+        if not self.redact_categoricals:
+            return True, None
+        mapping = self._redaction_maps.get(column)
+        if not mapping:
+            return False, None
+        return True, dict(mapping)
+
+    @staticmethod
+    def _as_spec_labels(raw: pd.Series,
+                        mapping: Optional[Dict[str, str]]) -> pd.Series:
+        """Values as the labels a spec emits, with nulls preserved as None."""
+        labels = raw.astype(str)
+        if mapping is not None:
+            labels = labels.map(mapping)
+        return labels.astype(object).where(raw.notna() & labels.notna(), None)
 
     def _composite_unique_constraints(
         self, uccs: Optional[List[Any]], pk: Optional[Any]

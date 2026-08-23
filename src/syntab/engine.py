@@ -1044,7 +1044,17 @@ class GenerationEngine:
 
                 nullable = col.constraints.get("nullable", True)
                 null_rate = float(col.constraints.get("null_rate", 0.0))
-                if col.dtype != "fk" and nullable and null_rate > 0 and rng.random() < null_rate:
+                # A conditional generator carries NULL as a value inside each
+                # per-key distribution, so it owns its own missingness.
+                # Injecting nulls on top at the column's marginal rate would
+                # double-count them, and would put them in the wrong rows:
+                # P(NULL | X) varies enormously by X -- some CFPB Issues have
+                # no sub-issue at all -- and one marginal rate applied
+                # uniformly is exactly the independence assumption this
+                # generator exists to remove.
+                if (col.dtype != "fk" and nullable and null_rate > 0
+                        and gen_name != "conditional"
+                        and rng.random() < null_rate):
                     row[col.name] = None
                     continue
 

@@ -36,6 +36,15 @@ SPIDER  unary inclusion dependencies (the foreign-key candidates).
         Bauckmann, Leser, Naumann & Tietz, "Efficiently Detecting Inclusion
         Dependencies", ICDE 2007.
 
+One construction here is this module's own rather than Desbordante's:
+``choose_dependency_forest`` turns the discovered dependencies into the
+in-degree-one dependency graph that generation can act on, following
+
+    Chow & Liu, "Approximating discrete probability distributions with
+    dependence trees", IEEE Transactions on Information Theory 14(3), 1968.
+
+It is a selection over discovered dependencies, not a discovery algorithm.
+
 BINDER (Papenbrock et al., PVLDB 2015) is the other standard IND algorithm and
 is named in Desbordante's own materials, but it is NOT exposed by the Python
 bindings of desbordante 2.4.1: ``desbordante.ind.algorithms`` offers exactly
@@ -588,6 +597,224 @@ def discover_functional_dependencies(
         ))
     out.sort(key=lambda f: (len(f.determinant), -(f.mu_prime or 1.0), f.determinant, f.dependent))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Choosing which dependencies generation can actually act on
+# ---------------------------------------------------------------------------
+
+# Error bound used when discovering dependencies to CONDITION GENERATION on,
+# as opposed to dependencies to REPORT. These are different questions and they
+# deserve different thresholds.
+#
+# Reporting an FD is a claim: "this rule holds in your data". DEFAULT_FD_ERROR
+# is deliberately tight (0.01) because a reported FD that does not hold is a
+# false statement about the source.
+#
+# Conditioning on a dependency claims nothing. Drawing Y from the observed
+# P(Y | X) reproduces the observed joint whether or not X determines Y
+# functionally -- if the dependency is only 80% clean, the conditional is 80%
+# concentrated and generation reproduces that too. So the question here is not
+# "is this a rule?" but "is X informative about Y?", which is what mu' already
+# measures.
+#
+# The bound still exists because the conditional table has to stay small, and
+# a dependency that is mostly noise produces a wide, sparse table with a large
+# disclosure surface and little fidelity to show for it.
+#
+# It is set at 0.05 for a measurable reason. On the 208,398-row CFPB source the
+# hierarchy edges have g1 errors of 0.019 (Sub-product -> Product) and 0.018
+# (Issue -> Sub-issue), both above DEFAULT_FD_ERROR, because roughly a fifth of
+# Sub-product and a third of Sub-issue are NULL and every null group counts as
+# a violation. At 0.01 those two edges are invisible and the hierarchy stays
+# broken; at 0.05 they are found, with mu' of 0.73 and 0.51.
+DEFAULT_CONDITIONAL_FD_ERROR = 0.05
+
+
+@dataclass(frozen=True)
+class ConditionalEdge:
+    """One ``determinant -> dependent`` edge that generation will act on."""
+
+    determinant: str
+    dependent: str
+    mu_prime: float           # strength in the CHOSEN direction (0.0 if unmeasured)
+    strength: float           # undirected strength that won the edge its place
+    fd: Optional[DiscoveredFD] = None   # the FD in the chosen direction, if any
+
+    def provenance(self) -> InferenceProvenance:
+        if self.fd is not None:
+            return self.fd.provenance()
+        # The edge was selected on the reverse direction's evidence: the pair
+        # is dependent, the arrow was turned round to keep the graph a forest.
+        return InferenceProvenance(
+            algorithm="Pyro",
+            citation=CITATIONS.get("Pyro"),
+            measure="g1",
+            mu_prime=round(self.strength, 6),
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "determinant": [self.determinant],
+            "dependent": self.dependent,
+            "reversed": self.fd is None,
+            "provenance": self.provenance().model_dump(
+                mode="json", exclude_none=True, exclude_defaults=True
+            ),
+        }
+
+
+def choose_dependency_forest(
+    fds: Sequence[DiscoveredFD],
+    columns: Optional[Sequence[str]] = None,
+) -> List[ConditionalEdge]:
+    """Pick the dependencies to condition generation on: a spanning forest.
+
+    WHY A FOREST AND NOT JUST "USE EVERY DISCOVERED FD".
+
+    A conditional generator draws Y from P(Y | X), so Y can have exactly one
+    determinant -- in-degree one. Discovery hands back many more edges than
+    that: on the CFPB source, Product is determined by Issue (mu' 0.967) and
+    by Sub-product (mu' 0.728), and Sub-product is determined by Product
+    (0.496) and by Issue (0.539). Taking the strongest determinant for each
+    column independently gives Product a parent, leaves Sub-product without
+    one, and the Product/Sub-product pair -- the thing that is broken -- stays
+    broken. The choice has to be made over the graph, not per column.
+
+    So: treat the columns as vertices and each discovered dependency as an
+    undirected edge weighted by the stronger of its two directions, take a
+    maximum-weight spanning forest, and orient each tree away from a root.
+    That is Chow & Liu's dependency-tree construction ("Approximating discrete
+    probability distributions with dependence trees", IEEE Trans. Information
+    Theory 14(3), 1968), with mu' (Piatetsky-Shapiro & Matheus, KDD-93) in
+    place of mutual information as the edge weight -- mu' because it is what
+    ``syntab.discovery`` already measures and because it is cardinality-
+    corrected, so a near-key column does not win every edge it touches. The
+    resulting per-column conditionals are the in-degree-one case of the
+    Bayesian-network factorization that ``generators._g_conditional`` samples.
+
+    On the CFPB hierarchy this picks all three edges -- Issue-Product (0.967),
+    Sub-product-Product (0.728), Sub-issue-Issue (0.614) -- where per-column
+    selection picks one.
+
+    ORIENTATION. Within a tree the arrows are determined by the root, and the
+    root is chosen to maximize the total mu' of the edges read in their chosen
+    direction, which prefers orientations that agree with a discovered FD.
+    Where it cannot -- a path A -> B <- C has to become A -> B -> C or
+    A <- B <- C -- the reversed edge is marked ``reversed`` in the spec. This
+    costs nothing in fidelity: P(X)P(Y|X) and P(Y)P(X|Y) both reproduce the
+    joint exactly. It costs something in readability, so it is recorded.
+
+    Only single-column determinants are considered. A composite determinant
+    would make the stored table approach the full joint, which is both a much
+    larger file and a much larger disclosure; see
+    ``profiler.MAX_CONDITIONAL_LHS``.
+    """
+    allowed = set(columns) if columns is not None else None
+
+    # Best FD per ordered pair.
+    directed: Dict[Tuple[str, str], DiscoveredFD] = {}
+    for f in fds:
+        if len(f.determinant) != 1:
+            continue
+        u, v = f.determinant[0], f.dependent
+        if u == v:
+            continue
+        if allowed is not None and (u not in allowed or v not in allowed):
+            continue
+        mu = f.mu_prime if f.mu_prime is not None else 0.0
+        best = directed.get((u, v))
+        if best is None or (best.mu_prime or 0.0) < mu:
+            directed[(u, v)] = f
+
+    # Undirected candidate edges, weighted by the stronger direction.
+    undirected: Dict[Tuple[str, str], float] = {}
+    for (u, v), f in directed.items():
+        pair = (u, v) if u <= v else (v, u)
+        mu = f.mu_prime if f.mu_prime is not None else 0.0
+        if mu > undirected.get(pair, -1.0):
+            undirected[pair] = mu
+
+    # Kruskal: heaviest edge first, skip anything that would close a cycle.
+    parent: Dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> bool:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return False
+        parent[ra] = rb
+        return True
+
+    chosen: List[Tuple[str, str, float]] = []
+    for (a, b), w in sorted(undirected.items(), key=lambda kv: (-kv[1], kv[0])):
+        if union(a, b):
+            chosen.append((a, b, w))
+
+    # Group the forest into trees and orient each away from its best root.
+    adjacency: Dict[str, List[Tuple[str, float]]] = {}
+    for a, b, w in chosen:
+        adjacency.setdefault(a, []).append((b, w))
+        adjacency.setdefault(b, []).append((a, w))
+
+    def orient(root: str) -> List[Tuple[str, str, float]]:
+        """BFS from ``root``, emitting (parent, child, undirected weight)."""
+        out: List[Tuple[str, str, float]] = []
+        seen = {root}
+        queue = [root]
+        while queue:
+            node = queue.pop(0)
+            for nxt, w in sorted(adjacency.get(node, [])):
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                out.append((node, nxt, w))
+                queue.append(nxt)
+        return out
+
+    def directed_mu(u: str, v: str) -> float:
+        f = directed.get((u, v))
+        return (f.mu_prime or 0.0) if f is not None else 0.0
+
+    edges: List[ConditionalEdge] = []
+    visited: set = set()
+    for vertex in sorted(adjacency):
+        if vertex in visited:
+            continue
+        component = sorted(_component(adjacency, vertex))
+        visited.update(component)
+        best_orientation, best_score = None, None
+        for root in component:
+            oriented = orient(root)
+            score = sum(directed_mu(u, v) for u, v, _ in oriented)
+            if best_score is None or score > best_score:
+                best_orientation, best_score = oriented, score
+        for u, v, w in (best_orientation or []):
+            edges.append(ConditionalEdge(
+                determinant=u, dependent=v,
+                mu_prime=directed_mu(u, v), strength=w,
+                fd=directed.get((u, v)),
+            ))
+    edges.sort(key=lambda e: (-e.strength, e.determinant, e.dependent))
+    return edges
+
+
+def _component(adjacency: Dict[str, List[Tuple[str, float]]], start: str) -> set:
+    seen = {start}
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        for nxt, _ in adjacency.get(node, []):
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return seen
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from .disclosure import DisclosureReport
 from .engine import GenerationEngine, SpecError
 from .loaders import from_file, spec_to_dict, to_file
 from .profiler import (
+    DEFAULT_CONDITION_ON_FDS,
     DEFAULT_MAX_CATEGORICAL,
     DEFAULT_MAX_CATEGORICAL_RATIO,
     DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
@@ -23,6 +24,7 @@ from .profiler import (
     RECOMMENDED_MIN_CELL_COUNT,
 )
 from .discovery import (
+    DEFAULT_CONDITIONAL_FD_ERROR,
     DEFAULT_FD_ERROR,
     DEFAULT_IND_ERROR,
     DEFAULT_MIN_MU,
@@ -205,6 +207,30 @@ def validate(spec_path: str) -> None:
                    "default: it is the expensive part of profiling and its "
                    "output is a report for a human rather than an input to "
                    "generation.")
+@click.option("--condition-on-fds/--no-condition-on-fds", "condition_on_fds",
+              default=DEFAULT_CONDITION_ON_FDS, show_default=True,
+              help="Generate a column that a discovered dependency determines "
+                   "by sampling from the observed conditional distribution "
+                   "given its determinant, instead of independently from its "
+                   "own marginal. This is what makes --discover-fds change "
+                   "the DATA rather than only the report: without it, a "
+                   "hierarchy like Product/Sub-product is measured, recorded "
+                   "and then destroyed at generation time. Requires "
+                   "--discover-fds. NOTE that a conditional distribution "
+                   "embeds more of the source than the two marginals it "
+                   "replaces -- the disclosure summary says how much.")
+@click.option("--conditional-fd-error", "conditional_fd_error",
+              default=DEFAULT_CONDITIONAL_FD_ERROR, type=float,
+              show_default=True,
+              help="Error bound for dependencies used to CONDITION "
+                   "generation, as opposed to --fd-error, which bounds the "
+                   "ones REPORTED. Looser on purpose: reporting a dependency "
+                   "claims it holds, while conditioning on one claims "
+                   "nothing -- an 80%-clean dependency yields an 80%-"
+                   "concentrated conditional and generation reproduces that "
+                   "too. On the CFPB source the hierarchy edges sit at g1 "
+                   "0.018-0.019, above --fd-error, because a fifth of "
+                   "Sub-product and a third of Sub-issue are NULL.")
 @click.option("--fd-error", "fd_error", default=DEFAULT_FD_ERROR, type=float,
               show_default=True,
               help="Error bound for approximate functional dependencies: the "
@@ -232,6 +258,7 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             max_categorical: int, max_categorical_ratio: float,
             min_cell_count: int, redact_categoricals: bool,
             pii: str, pii_strategy: str, discover, discover_fds: bool,
+            condition_on_fds: bool, conditional_fd_error: float,
             fd_error: float, fd_min_mu: float, ind_error: float,
             merge_into: str) -> None:
     """Profile one or more datasets into a Spec.
@@ -254,6 +281,8 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
                 redact_categoricals=redact_categoricals,
                 min_cell_count=min_cell_count,
                 discover=discover, discover_fds=discover_fds,
+                condition_on_fds=condition_on_fds,
+                conditional_fd_error=conditional_fd_error,
                 fd_error=fd_error, fd_min_mu=fd_min_mu, ind_error=ind_error)
     if len(datasets) == 1:
         profiler = DatasetProfiler.from_file(
@@ -306,6 +335,21 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     if n_fd:
         click.echo(f"  {n_fd} functional dependenc"
                    f"{'y' if n_fd == 1 else 'ies'} recorded")
+    conditionals = [c for t in spec.tables
+                    for c in t.metadata.get("discovery", {})
+                    .get("conditional_dependencies", [])]
+    if conditionals:
+        click.echo(f"  {len(conditionals)} column(s) generated conditionally:")
+        for c in conditionals:
+            note = " (arrow reversed to keep the graph a forest)" if c.get(
+                "reversed") else ""
+            mu = c.get("provenance", {}).get("mu_prime")
+            strength = f"  mu'={mu}" if mu is not None else ""
+            click.echo(f"      {c['determinant'][0]} -> {c['dependent']}"
+                       f"{strength}{note}")
+    elif discover_fds and condition_on_fds:
+        click.echo("  no dependency was strong enough to condition generation "
+                   "on; every column is sampled independently")
     if merge_into:
         click.echo(f"  merged into {merge_into}: {n_kept} hand-edited rule(s) preserved")
     # The disclosure summary goes to stderr, deliberately. It is a notice about
