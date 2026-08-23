@@ -565,18 +565,23 @@ Two controls, both standard statistical-disclosure-control techniques:
 ```bash
 # generalize categorical values occurring fewer than K times in the SOURCE
 # into an "__other__" bucket. Rare values are the identifying ones.
-syntab profile data.parquet --out spec.yaml --min-cell-count 5
+syntab profile data.parquet --out spec.yaml            # K=5 by default
+syntab profile data.parquet --out spec.yaml --min-cell-count 0   # opt out
 
 # replace categorical labels with opaque tokens, keeping cardinality and the
 # frequency vector — so the spec still generates and still conforms.
 syntab profile data.parquet --out spec.yaml --redact-categoricals
 ```
 
-`--min-cell-count` defaults to `0` (off), because enabling suppression silently
-changes the statistical content of every profile and that is the data holder's
-decision. The summary reports how many values fall below the recommended
-threshold of 5 either way, so the decision is put in front of you rather than
-made for you.
+`--min-cell-count` defaults to `5` (on). Rare categorical values are the ones
+that identify people, and a spec now records not just which values exist but
+which ones **co-occur** — on the reference dataset the same `K=5` suppresses 61
+conditional cells against 2 marginal values. Getting this default wrong in the
+protective direction costs fidelity and says so in the summary; getting it
+wrong in the other direction writes identifying values into a file that gets
+committed and shared. Pass `--min-cell-count 0` to opt out explicitly and
+profile at full fidelity. The summary reports how many values fall below the
+threshold either way.
 
 Synthetic data is **not** automatically anonymous — a generator that faithfully
 reproduces a two-member category reproduces the fact that those two people
