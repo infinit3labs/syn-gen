@@ -202,3 +202,63 @@ def test_quote_identifier_round_trips_through_the_parser(name):
     rule = Rule(f"{quote_identifier(name)} == 1")
     assert rule.column_refs() == [name]
     assert rule.check({name: 1}, {}) is True
+
+
+# --------------------------------------------------------------------------
+# load-bearing, not decorative: the engine paths that were unreachable
+# --------------------------------------------------------------------------
+
+def test_a_when_clause_can_now_name_a_real_cfpb_column():
+    """The ``when`` path was unusable for profiled CFPB data, for this reason."""
+    from syntab.engine import GenerationEngine
+    from syntab.spec import (ColumnSpec, Settings, Spec, SpecMetadata,
+                             TableSpec, WhenClause)
+
+    spec = Spec(
+        metadata=SpecMetadata(name="complaints"),
+        settings=Settings(seed=4),
+        tables=[TableSpec(
+            name="complaints", row_count=200,
+            columns=[
+                ColumnSpec(
+                    name="Company Response to Consumer", dtype="str",
+                    generator="choice",
+                    params={"values": ["Closed with explanation",
+                                       "Closed with monetary relief"]},
+                    when=[WhenClause(
+                        condition="`Timely response?` == 'No'",
+                        generator="const",
+                        params={"value": "Untimely"},
+                    )],
+                ),
+                ColumnSpec(
+                    name="Timely response?", dtype="str", generator="choice",
+                    params={"values": ["Yes", "No"], "weights": [0.6, 0.4]},
+                ),
+            ],
+            rules=["if `Timely response?` == 'No' then "
+                   "`Company Response to Consumer` == 'Untimely'"],
+        )],
+    )
+    frame = GenerationEngine(spec).run().to_frames()["complaints"]
+    untimely = frame[frame["Timely response?"] == "No"]
+    assert len(untimely) > 0
+    assert (untimely["Company Response to Consumer"] == "Untimely").all()
+
+
+def test_an_unknown_quoted_column_in_a_when_clause_is_rejected():
+    from syntab.engine import GenerationEngine
+    from syntab.spec import (ColumnSpec, Spec, SpecError, SpecMetadata,
+                             TableSpec, WhenClause)
+
+    spec = Spec(
+        metadata=SpecMetadata(name="t"),
+        tables=[TableSpec(name="t", row_count=5, columns=[
+            ColumnSpec(name="a", dtype="int", generator="int",
+                       when=[WhenClause(condition="`no such column` == 1",
+                                        generator="const",
+                                        params={"value": 0})]),
+        ])],
+    )
+    with pytest.raises(SpecError, match="no such column"):
+        GenerationEngine(spec)
