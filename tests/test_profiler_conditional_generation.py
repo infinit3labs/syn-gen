@@ -289,12 +289,59 @@ def test_redaction_still_reproduces_the_hierarchy_under_placeholders():
 
 
 def test_redaction_without_a_vocabulary_skips_the_edge_rather_than_leaking():
-    """A column with no placeholder mapping cannot take part at all."""
+    """A column with no declared vocabulary cannot take part at all."""
+    from syntab.spec import ColumnSpec
+
     profiler = DatasetProfiler(hierarchy_frame(), name="c", sample=None, seed=7,
                                discover=True, discover_fds=True,
                                redact_categoricals=True)
-    profiler._redaction_maps.clear()
-    spec = profiler.profile()
-    # profile() rebuilds the maps, so clear them by profiling a frame whose
-    # dependent has no categorical profile instead: assert the guard directly.
-    assert profiler._label_map("not a column") == (False, None)
+    bare = ColumnSpec(name="not profiled", dtype="str")
+    assert profiler._label_map(bare) is None
+
+
+# --------------------------------------------------------------------------
+# the conditional table says only what the spec already declares
+# --------------------------------------------------------------------------
+
+def test_conditional_keys_stay_inside_the_determinants_vocabulary():
+    """A key the determinant can never generate is dead weight and a leak.
+
+    The declared vocabulary comes from the profiling SAMPLE; the conditional
+    table is built from the FULL frame. Without the restriction the table
+    carries keys nothing can ever look up, each one an extra real label in
+    the file that ``profile.categorical.values`` does not account for.
+    """
+    frame = hierarchy_frame(n=4000)
+    # A sub-product that is far too rare to survive a 200-row sample.
+    frame.loc[frame.index[:3], "sub_product"] = "only in the full data"
+    frame.loc[frame.index[:3], "product"] = "loan"
+    spec = profiled(frame, sample=200)
+    sub = column(spec, "sub_product")
+    product = column(spec, "product")
+    if product.generator != "conditional":
+        pytest.skip("no dependency survived the smaller sample")
+    declared = set(sub.profile.categorical.values)
+    keys = {k[0] for k in product.params["keys"] if k[0] is not None}
+    assert keys <= declared
+
+
+def test_conditional_values_stay_inside_the_dependents_vocabulary():
+    spec = profiled(hierarchy_frame())
+    product = column(spec, "product")
+    declared = set(product.profile.categorical.values)
+    emitted = {v for row in product.params["values"] for v in row
+               if v is not None}
+    emitted |= {v for v in product.params["default"]["values"] if v is not None}
+    assert emitted <= declared
+
+
+def test_an_out_of_vocabulary_value_joins_the_other_bucket_when_there_is_one():
+    """Suppression generalizes; it must not silently drop rows."""
+    frame = hierarchy_frame()
+    frame.loc[frame.index[:2], "product"] = "rare secret"
+    spec = profiled(frame, min_cell_count=RECOMMENDED_MIN_CELL_COUNT)
+    product = column(spec, "product")
+    assert OTHER_BUCKET_LABEL in product.profile.categorical.values
+    emitted = {v for row in product.params["values"] for v in row}
+    assert "rare secret" not in emitted
+    assert OTHER_BUCKET_LABEL in emitted

@@ -1766,8 +1766,7 @@ class DatasetProfiler:
             determinant = by_name.get(edge.determinant)
             if dependent is None or determinant is None:
                 continue
-            params = self._conditional_params(df, edge.determinant,
-                                              edge.dependent)
+            params = self._conditional_params(df, determinant, dependent)
             if params is None:
                 continue
             dependent.generator = "conditional"
@@ -1779,17 +1778,24 @@ class DatasetProfiler:
         return applied
 
     def _conditional_params(
-        self, df: pd.DataFrame, determinant: str, dependent: str,
+        self, df: pd.DataFrame, determinant: ColumnSpec, dependent: ColumnSpec,
     ) -> Optional[Dict[str, Any]]:
         """Empirical P(dependent | determinant), in the vocabulary of the spec.
 
-        Three alignments have to hold or the conditional silently degrades to
-        the fallback marginal, which would look like it worked:
+        Three alignments have to hold or the conditional is either wrong or
+        larger than it needs to be:
 
-        LABELS. The categorical profile stores ``str(value)`` labels drawn
-        from the SAMPLE. Generation can only ever emit those labels, so the
-        conditional table is restricted to them; a full-data value the sample
-        never saw is unreachable and only inflates the file.
+        VOCABULARY. Both sides are expressed in the labels the spec already
+        declares in ``profile.categorical.values``, and nothing else. That is
+        not a detail. Those labels come from the profiling SAMPLE while this
+        table is built from the FULL frame, so without the restriction a
+        conditional would carry keys the determinant's own generator can never
+        produce -- 30 of 161 dead keys on the CFPB Issue column -- and emit
+        dependent values the column's declared vocabulary does not list. The
+        first is waste; the second is worse, because it makes
+        ``profile.categorical.values`` an inaccurate statement of what real
+        labels the file contains, and that field is what a disclosure review
+        reads. A spec should say what it does.
 
         NULLS. A null determinant is a key like any other -- 18.8% of CFPB
         Sub-product is null and those rows still have a Product. A null
@@ -1800,15 +1806,17 @@ class DatasetProfiler:
         marginal rate applied uniformly would put the missingness in the wrong
         rows and take the pair-trend score down with it.
 
-        REDACTION. Under --redact-categoricals both sides are translated into
-        the same placeholder vocabulary the marginals use, so the conditional
-        table introduces no real label. See the disclosure note below.
+        REDACTION. Under --redact-categoricals the declared vocabulary is the
+        placeholder set, so the same restriction is what keeps real labels out
+        of the conditional table.
 
         CELL COUNTS. --min-cell-count is applied per determinant group, using
         the conditional cell count. This is stricter than applying it to the
         marginals, and deliberately so: a conditional cell is a smaller group
         than a marginal cell by construction, so the suppression matters more
-        here, not less.
+        here, not less. Where suppression has already put an ``__other__``
+        bucket in a column's vocabulary, out-of-vocabulary values join it
+        rather than being dropped -- that is what the bucket is for.
 
         DISCLOSURE NOTE
         ---------------
@@ -1818,56 +1826,60 @@ class DatasetProfiler:
         """
         from .generators import conditional_params
 
-        det_ok, det_map = self._label_map(determinant)
-        dep_ok, dep_map = self._label_map(dependent)
-        if not det_ok or not dep_ok:
+        det_map = self._label_map(determinant)
+        dep_map = self._label_map(dependent)
+        if det_map is None or dep_map is None:
             return None
 
-        det_raw, dep_raw = df[determinant], df[dependent]
+        det_raw, dep_raw = df[determinant.name], df[dependent.name]
         det_labels = self._as_spec_labels(det_raw, det_map)
         dep_labels = self._as_spec_labels(dep_raw, dep_map)
 
-        # A value with no label in the emitted vocabulary can never be
+        # A value with no label in the declared vocabulary can never be
         # generated (determinant) or must never be generated (dependent), so
-        # its rows say nothing about what generation will do. Only reachable
-        # under redaction, where the vocabulary is a fixed placeholder set.
+        # its rows say nothing about what generation will do.
         keep = (det_raw.isna() | det_labels.notna()) & (
             dep_raw.isna() | dep_labels.notna())
         if not bool(keep.any()):
             return None
 
         frame = pd.DataFrame({
-            determinant: det_labels[keep],
-            dependent: dep_labels[keep],
+            determinant.name: det_labels[keep],
+            dependent.name: dep_labels[keep],
         })
         return conditional_params(
-            frame, [determinant], dependent,
+            frame, [determinant.name], dependent.name,
             min_cell_count=self.min_cell_count,
             other_label=OTHER_BUCKET_LABEL,
         )
 
-    def _label_map(self, column: str) -> Tuple[bool, Optional[Dict[str, str]]]:
-        """``(usable, mapping)`` for translating real values into spec labels.
+    def _label_map(self, col: ColumnSpec) -> Optional[Dict[str, str]]:
+        """Real ``str(value)`` label -> the label this spec declares for it.
 
-        ``mapping is None`` means identity -- the spec carries the real labels,
-        so no translation is needed. Under --redact-categoricals the mapping is
-        the placeholder vocabulary recorded when the marginal was built, and a
-        column that has none cannot take part in a conditional at all.
+        None when the column declares no categorical vocabulary, which
+        disqualifies it from taking part in a conditional at all. Identity
+        over the declared labels normally; the placeholder vocabulary under
+        --redact-categoricals.
         """
-        if not self.redact_categoricals:
-            return True, None
-        mapping = self._redaction_maps.get(column)
-        if not mapping:
-            return False, None
-        return True, dict(mapping)
+        prof = col.profile.categorical if col.profile else None
+        if prof is None or not prof.values:
+            return None
+        if self.redact_categoricals:
+            mapping = self._redaction_maps.get(col.name)
+            return dict(mapping) if mapping else None
+        return {label: label for label in prof.values}
 
     @staticmethod
-    def _as_spec_labels(raw: pd.Series,
-                        mapping: Optional[Dict[str, str]]) -> pd.Series:
-        """Values as the labels a spec emits, with nulls preserved as None."""
-        labels = raw.astype(str)
-        if mapping is not None:
-            labels = labels.map(mapping)
+    def _as_spec_labels(raw: pd.Series, mapping: Dict[str, str]) -> pd.Series:
+        """Values as the labels this spec declares, with nulls kept as None.
+
+        A value outside the vocabulary joins the ``__other__`` bucket when
+        suppression has created one, and is otherwise dropped by the caller.
+        """
+        labels = raw.astype(str).map(mapping)
+        other = mapping.get(OTHER_BUCKET_LABEL)
+        if other is not None:
+            labels = labels.where(labels.notna() | raw.isna(), other)
         return labels.astype(object).where(raw.notna() & labels.notna(), None)
 
     def _composite_unique_constraints(
