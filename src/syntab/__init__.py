@@ -13,9 +13,21 @@ from .spec import (
 )
 from .loaders import from_file, from_dict, to_file
 from .engine import GenerationEngine, GenerationResult, SpecError, RuleViolation
-from .generators import BaseGenerator, register_generator, get_registry
+from .generators import (
+    BaseGenerator,
+    register_generator,
+    get_registry,
+    empirical_text_params,
+)
+from .infer import fit_text_params
 from .profiler import DatasetProfiler
 from .validator import validate, ValidationReport
+from .quality import (
+    quality_report,
+    diagnostic_report,
+    QualityReport,
+    DiagnosticReport,
+)
 from .conformance import (
     validate_against_spec,
     SpecConformance,
@@ -29,7 +41,9 @@ __all__ = [
     "from_file", "from_dict", "to_file",
     "GenerationEngine", "GenerationResult", "SpecError", "RuleViolation",
     "BaseGenerator", "register_generator", "get_registry",
+    "empirical_text_params", "fit_text_params",
     "DatasetProfiler",
     "validate", "ValidationReport",
+    "quality_report", "diagnostic_report", "QualityReport", "DiagnosticReport",
     "validate_against_spec", "SpecConformance", "TableConformance", "Check",
 ]

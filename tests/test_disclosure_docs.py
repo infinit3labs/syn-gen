@@ -73,8 +73,18 @@ def test_doc_explains_the_default_and_its_rationale(doc_text):
 
 
 def test_every_flag_the_doc_mentions_is_a_real_profile_option(doc_text):
-    """The drift guard that actually catches things."""
-    real = {opt for p in profile_cmd.params for opt in getattr(p, "opts", [])}
+    """The drift guard that actually catches things.
+
+    ``secondary_opts`` as well as ``opts``: click keeps the OFF half of a
+    ``--x/--no-x`` pair there, so reading ``opts`` alone made the guard reject
+    ``--no-condition-on-fds`` -- a real option -- as non-existent. The
+    assertion is unchanged; this only completes its idea of what click
+    considers a flag.
+    """
+    real = {opt
+            for p in profile_cmd.params
+            for opt in (list(getattr(p, "opts", []))
+                        + list(getattr(p, "secondary_opts", [])))}
     mentioned = set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]+", doc_text))
     unknown = mentioned - real
     assert not unknown, f"doc mentions non-existent flag(s): {sorted(unknown)}"

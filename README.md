@@ -15,6 +15,11 @@ compatible dataset. The profiler round-trip uses `generator: auto` + embedded
   orders columns within a table.
 - **Business-rule DSL**: a safe, hand-written expression language for within-table
   and cross-join constraints (`region == user.region`, `if region == 'EU' then total > 0`).
+  Columns whose names are not bare identifiers are written in backticks:
+  `` `ZIP code` == '02139' ``, `` `Timely response?` == 'Yes' ``.
+- **Conditional generation**: sample a column from the observed
+  P(column | determinant) instead of independently, so relationships between
+  columns survive a profile/generate round trip.
 - **Hybrid enforcement**: rejection sampling + FK-parent re-picking, with
   configurable `fallback` (`raise` | `drop` | `null`).
 - **Outputs**: CSV / JSON / JSONL / Parquet / SQL. Both a **library** and a **CLI**.
@@ -23,6 +28,8 @@ compatible dataset. The profiler round-trip uses `generator: auto` + embedded
 ```bash
 pip install -e .
 pip install -e ".[parquet,dev]"   # optional parquet + dev deps
+pip install -e ".[discovery]"     # key / foreign-key / dependency discovery
+                                  # (AGPL-3.0-only, Linux + macOS wheels only)
 ```
 
 ## Library
@@ -64,17 +71,59 @@ See `examples/profiled_consumer_complaints.yaml` (profiled from the public
 CFPB consumer-finance-complaints dataset on HuggingFace) and its synthesized
 `examples/profiled_consumer_complaints_sample.parquet`.
 
-## Validating synthetic vs real data
-The `validate` module compares real and synthetic datasets **column by column**
-using statistical distances:
+## Evaluating synthetic data
+
+Three reports, answering three different questions. See
+**[docs/quality.md](docs/quality.md)** for the metric definitions and the
+SDMetrics dependency decision.
+
+| Command | Question | Output | Needs real data? |
+|---|---|---|---|
+| `syntab quality` | How closely does the synthetic data **resemble** the real data? | Graded, 0..1 | yes |
+| `syntab diagnose` | Is the synthetic data structurally **valid**? | Pass/fail | yes |
+| `syntab check` | Does the output honour its **Spec**? | Pass/fail | no |
+
+Fidelity is a matter of degree, so `quality` scores it rather than judging it.
+Structural validity is not — a category that does not exist in the source is
+simply wrong — so `diagnose` is pass/fail. Spec conformance is a third
+question, which is why it needs no source data and is not folded into either.
+
+```bash
+syntab quality  --real data.parquet --synthetic out.csv --verbose
+syntab quality  --real data.parquet --synthetic out.csv --min-score 0.8   # CI gate
+syntab diagnose --real data.parquet --synthetic out.csv --spec spec.yaml
+syntab check    --spec spec.yaml --data out/
+```
+
+```python
+from syntab import quality_report, diagnostic_report
+report = quality_report(real_df, synthetic_df, spec=spec)
+print(report.overall_score)
+print(report.to_text(verbose=True))
+```
+
+`quality` scores five properties — Column Shapes, **Column Pair Trends**,
+Coverage, Boundary Adherence and Missing Value Similarity — each a named
+SDMetrics metric (`github.com/sdv-dev/SDMetrics`). Column Pair Trends is
+the one that matters most here: a rule-based generator samples each column
+independently by construction, so it is exactly the kind of generator that can
+reproduce every marginal perfectly while destroying every relationship between
+columns. A marginals-only check cannot see that; this one can.
+
+### Per-column distances (`compare`)
+
+`syntab compare` remains as the quick per-column gate. It is **marginals only**
+— it says nothing about the relationships between columns, so a dataset can
+pass it with every correlation destroyed:
 
   * numeric / datetime → Kolmogorov–Smirnov statistic D (empirical-CDF supremum)
   * categorical / boolean → Total Variation Distance (0.5 · Σ|p − q|)
-  * text → structural distance (length stats + character-distribution TVD;
-    free text is *not* matched semantically, so it can only warn, never fail)
+  * text → structural distance (length statistics + character-distribution TVD)
 
-Each column gets a `pass` / `warn` / `fail` against configurable thresholds, and
-an overall verdict (free-text mismatches never hard-fail it).
+Each column gets a `pass` / `warn` / `fail` against configurable thresholds,
+and an overall verdict. Text columns are included in that verdict: length
+distribution and character frequency are structural properties, not semantic
+ones, and they are what a broken text generator gets wrong.
 
 ```bash
 # Python
@@ -102,8 +151,8 @@ A round-trip (`profile` → `generate` → `compare`) therefore matches real
 numeric distributions with low KS distance.
 
 ## Checking conformance to a Spec
-`compare` checks real-vs-synthetic *distributions*; `check` certifies that a
-generated (or real) dataset actually **obeys its Spec** — primary-key and
+`quality` and `compare` check synthetic data against *real data*; `check`
+certifies that a generated (or real) dataset actually **obeys its Spec** — primary-key and
 per-column uniqueness, not-null / `null_rate` constraints, foreign-key
 integrity, and every business rule (in-table *and* cross-join via parent
 aliases):
@@ -127,15 +176,54 @@ violations, and any cross-join rule that references the broken key cascades
 into a failure on the child table as well.
 
 ## Profiling multiple tables
-`syntab profile` accepts **one or more** datasets. With several, it infers
-foreign-key relationships: a column `<parent>_id` is linked to the table whose
-name matches `<parent>` (or its plural) and whose primary-key values are a
-superset of the column's values. Strong numeric correlations are recorded as
-`metadata.suggested_depends_on` hints (non-breaking).
+`syntab profile` accepts **one or more** datasets. With several, it discovers
+foreign-key relationships from *inclusion dependencies* (SPIDER), not from
+column names:
 
 ```bash
+pip install "syntab[discovery]"
 syntab profile users.csv orders.csv --out spec.yaml
 ```
+
+On the real CFPB extract, normalized into the star schema its own values
+describe, the previous name-based rule (`<parent>_id` matching a table name)
+finds **0** of the 6 foreign keys that are there, because no CFPB column is
+named after a table. SPIDER finds all 6 in about four seconds.
+
+Keys come from discovered unique column combinations (HyUCC) rather than from
+names; the name is only a tie-breaker between candidates the data cannot
+separate. Functional dependencies (HyFD for exact ones, Pyro for approximate
+ones) are available with `--discover-fds`.
+
+**Discovered dependencies steer generation.** A column determined by another is
+generated by sampling from the observed conditional distribution rather than
+independently from its own marginal, so a hierarchy in the source survives the
+round trip. On the 208,398-row CFPB extract:
+
+| Column pair | Independent sampling | Conditional |
+|---|---|---|
+| `Product \| Sub-product` | 0.162 | **0.979** |
+| `Issue \| Sub-issue` | 0.159 | **0.942** |
+| Overall quality score | 0.834 | **0.867** |
+
+The dependency graph is a maximum-weight spanning forest over the discovered
+dependencies (Chow & Liu 1968), giving each column at most one determinant.
+This is a **disclosure** change as well as a fidelity one — a conditional table
+is a contingency table of the source — so read
+[docs/disclosure.md §3.3](docs/disclosure.md) and use `--no-condition-on-fds`
+if a cross-tabulation must not leave the boundary. Details in
+[docs/discovery.md](docs/discovery.md).
+
+Every inferred rule records which algorithm produced it, over how many rows,
+and how strong the evidence was -- and `--merge-into` lets you re-profile
+without losing hand edits.
+
+**Desbordante, which provides the algorithms, is AGPL-3.0-only and ships no
+Windows wheel**, which is why it is an optional extra. Profiling works without
+it, falling back to the name-based rules and saying so in the spec.
+
+See **[docs/discovery.md](docs/discovery.md)** for the algorithms, the
+measures, the cost and the guards.
 
 ## PII / anonymization
 A profiled dataset can contain personally identifiable information. syntab
@@ -185,9 +273,38 @@ Programmatic sinks (`formats.CSVSink`, `formats.JSONLSink`, or any object with
 a `write_table(name, rows)` method) can be passed to
 `GenerationEngine.run(stream_sink=...)`.
 
-## Conditional generators and rule retries
-Columns can select a generator branch using the same safe rule DSL used by
-business rules. The first matching `when` branch wins; otherwise the default
+## Conditional generation
+
+Two mechanisms, for two different shapes of problem.
+
+### `conditional` — sample Y given X
+
+For a dependency with many determinant values, `conditional` stores the
+observed P(dependent | determinant) and draws from the row it applies to. This
+is what `syntab profile --discover-fds` writes for a discovered dependency, and
+it is what preserves a hierarchy across a profile/generate round trip:
+
+```yaml
+- name: Product
+  dtype: str
+  generator: conditional
+  params:
+    on: ["Sub-product"]
+    keys:    [["Checking account"], ["Auto loan"], [null]]
+    values:  [["Bank account or service"], ["Consumer loan"], ["Mortgage", "Consumer loan"]]
+    weights: [[1.0], [1.0], [0.7, 0.3]]
+    default: {values: ["Bank account or service", "Mortgage"], weights: [0.6, 0.4]}
+```
+
+`params.on` is the generation dependency, so the engine orders the determinant
+first without needing it restated in `depends_on`. An unseen key falls back to
+`default`; a `conditional` column carries NULL as a value inside its per-key
+distributions rather than through `constraints.null_rate`.
+
+### `when` — pick a generator branch by rule
+
+Columns can instead select a generator branch using the same safe rule DSL used
+by business rules. The first matching `when` branch wins; otherwise the default
 generator is used. References in branch conditions automatically become column
 dependencies, so the referenced columns are generated first:
 

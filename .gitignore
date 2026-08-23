@@ -139,3 +139,6 @@ htmlcov/
 *~
 .DS_Store
 Thumbs.db
+
+# desbordante writes this into the working directory on import
+myeasylog.log
