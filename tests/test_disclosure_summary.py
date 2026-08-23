@@ -32,6 +32,13 @@ def _clinic(n=400):
 
 
 def _report(df=None, **kw):
+    # Pinned to K=0 so the baseline report is the un-suppressed one these
+    # tests were written against: 25 embedded values, 20 of them rare, both
+    # controls off. Tests that want suppression pass min_cell_count
+    # explicitly. Without this pin the "controls not applied" cases and the
+    # budget cases would be asserting against the default rather than against
+    # a stated condition.
+    kw.setdefault("min_cell_count", 0)
     spec = DatasetProfiler(df if df is not None else _clinic(),
                            name="clinic", sample=None, seed=SEED, **kw).profile()
     return DisclosureReport.from_spec(spec)
@@ -215,6 +222,10 @@ def test_profile_cli_enforces_disclosure_budget_before_writing(tmp_path):
     out = tmp_path / "s.yaml"
     res = CliRunner().invoke(cli, [
         "profile", str(data), "--out", str(out),
+        # K=0 so there ARE 25 unredacted values to blow the budget of 10.
+        # Under the default K=5 the rare diagnoses are generalized away and
+        # the budget would pass, which would make this test assert nothing.
+        "--min-cell-count", "0",
         "--max-unredacted-values", "10",
     ])
 

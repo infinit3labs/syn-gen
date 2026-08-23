@@ -32,6 +32,11 @@ def _codes_frame(n_codes, n_rows):
 
 def _profile(df, **kw):
     kw.setdefault("sample", None)
+    # These tests are about which columns become categorical and how many
+    # values survive the --max-categorical thresholds. Minimum cell-size
+    # suppression removes values for an unrelated reason and would confound
+    # every count below, so it is pinned off unless a test asks for it.
+    kw.setdefault("min_cell_count", 0)
     return DatasetProfiler(df, name="t", seed=SEED, **kw).profile()
 
 
@@ -138,13 +143,16 @@ def test_cli_exposes_max_categorical(tmp_path):
     runner = CliRunner()
     default_out = tmp_path / "default.yaml"
     res = runner.invoke(cli, ["profile", str(data), "--out", str(default_out),
-                              "--sample", "400"])
+                              "--sample", "400", "--min-cell-count", "0"])
     assert res.exit_code == 0, res.output
     assert from_file(default_out).tables[0].columns[0].profile.categorical is None
 
     wide_out = tmp_path / "wide.yaml"
     res = runner.invoke(cli, ["profile", str(data), "--out", str(wide_out),
-                              "--sample", "400", "--max-categorical", "200"])
+                              "--sample", "400", "--max-categorical", "200",
+                              # see _profile(): suppression would eat the
+                              # rare codes this assertion counts
+                              "--min-cell-count", "0"])
     assert res.exit_code == 0, res.output
     cat = from_file(wide_out).tables[0].columns[0].profile.categorical
     assert cat is not None

@@ -176,12 +176,12 @@ def validate(spec_path: str) -> None:
                    "generalized into a single '__other__' bucket, preserving "
                    "total frequency mass. Rare values are the ones that "
                    "identify people (k-anonymity), so this is the control "
-                   f"that matters most. 0 disables it; {RECOMMENDED_MIN_CELL_COUNT} "
-                   "is the usual floor in published SDC practice. Left off by "
-                   "default because it changes the statistical content of the "
-                   "profile and that is the data holder's call -- but the "
-                   "disclosure summary reports what it would have caught "
-                   "either way.")
+                   f"that matters most, and it is ON by default at K="
+                   f"{RECOMMENDED_MIN_CELL_COUNT}, the usual floor in "
+                   "published SDC practice. Pass 0 to disable it and profile "
+                   "at full fidelity -- an explicit choice to write the "
+                   "identifying values into the spec. The disclosure summary "
+                   "reports which way it went either way.")
 @click.option("--redact-categoricals", "redact_categoricals", is_flag=True,
               help="Replace categorical values in the written spec with "
                    "opaque placeholder tokens (value_001, value_002, ...). "

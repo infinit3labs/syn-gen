@@ -68,8 +68,16 @@ def test_documented_recommended_threshold_matches_the_code(doc_text):
 
 
 def test_doc_explains_the_default_and_its_rationale(doc_text):
-    assert "The default is `0`, i.e. off." in doc_text
+    """Updated when the default flipped from 0 to 5.
+
+    The assertion's job is unchanged -- the doc must state the default and
+    justify it -- but it named the old value literally, so it had to move with
+    it. The opt-out is now asserted too, since an on-by-default control that
+    does not document its escape hatch is the worse failure.
+    """
+    assert "The default is `5`, i.e. on." in doc_text
     assert "deliberate" in doc_text
+    assert "--min-cell-count 0" in doc_text
 
 
 def test_every_flag_the_doc_mentions_is_a_real_profile_option(doc_text):

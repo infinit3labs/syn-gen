@@ -372,7 +372,9 @@ class DisclosureReport:
                      f"'{OTHER_BUCKET_LABEL}')")
         else:
             L.append(f"   --min-cell-count        not applied "
-                     f"(recommended: {RECOMMENDED_MIN_CELL_COUNT})")
+                     f"-- explicitly disabled with 0 "
+                     f"(recommended: {RECOMMENDED_MIN_CELL_COUNT}, the "
+                     f"default)")
         if self.rare_values:
             L.append(f"       {self.rare_values:,} embedded value(s) occur fewer "
                      f"than {RECOMMENDED_MIN_CELL_COUNT} times in the source.")
