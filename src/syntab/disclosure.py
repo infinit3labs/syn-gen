@@ -43,6 +43,36 @@ class CategoricalDisclosure:
 
 
 @dataclass
+class ConditionalDisclosure:
+    """A conditional distribution embedded in the spec.
+
+    Materially different from the marginals it sits beside, and the reason
+    this class exists rather than the conditional being folded into
+    ``CategoricalDisclosure``. A marginal says which values occur and how
+    often. A conditional says which COMBINATIONS occur and in what proportion
+    -- P(Sub-product | Product) for every observed pair. That is a
+    contingency table of the source, and it is a larger disclosure than the
+    two marginals it replaces even though it makes the synthetic data better.
+
+    A fidelity win that widens the privacy surface without saying so is
+    exactly what this module exists to prevent, so it is counted separately
+    and named in the notice.
+    """
+
+    table: str
+    determinant: List[str]
+    dependent: str
+    n_keys: int            # distinct determinant values with their own row
+    n_cells: int           # (determinant, dependent) pairs recorded in total
+    redacted: bool         # labels on both sides are placeholders
+    suppressed_cells: int  # cells generalized into the other bucket
+
+    @property
+    def qualified(self) -> str:
+        return f"{'/'.join(self.determinant)} -> {self.dependent}"
+
+
+@dataclass
 class PiiDisclosure:
     table: str
     column: str
@@ -60,6 +90,7 @@ class DisclosureReport:
 
     n_columns: int = 0
     categoricals: List[CategoricalDisclosure] = field(default_factory=list)
+    conditionals: List[ConditionalDisclosure] = field(default_factory=list)
     pii: List[PiiDisclosure] = field(default_factory=list)
     key_candidates: List[str] = field(default_factory=list)
     n_numeric_ranges: int = 0
@@ -103,11 +134,28 @@ class DisclosureReport:
         return min(ks) if ks else None
 
     @property
+    def conditional_keys(self) -> int:
+        return sum(c.n_keys for c in self.conditionals)
+
+    @property
+    def conditional_cells(self) -> int:
+        return sum(c.n_cells for c in self.conditionals)
+
+    @property
+    def suppressed_conditional_cells(self) -> int:
+        return sum(c.suppressed_cells for c in self.conditionals)
+
+    @property
     def needs_review(self) -> bool:
-        """Whether anything here warrants a human decision before sharing."""
+        """Whether anything here warrants a human decision before sharing.
+
+        Conditionals count even when redacted. Redaction removes the labels;
+        it does not remove the fact that the spec records which category
+        co-occurs with which, and how often.
+        """
         return bool(self.embedded_values or self.pii or self.key_candidates
                     or self.n_numeric_ranges or self.n_datetime_ranges
-                    or self.n_string_shapes)
+                    or self.n_string_shapes or self.conditionals)
 
     # ---- construction ----------------------------------------------------
     @classmethod
@@ -123,6 +171,9 @@ class DisclosureReport:
                     f"{table.name}.{name}" if multi else str(name))
 
             for col in table.columns:
+                if col.generator == "conditional":
+                    rep.conditionals.append(
+                        _conditional_disclosure(table.name, col))
                 if col.pii:
                     rep.pii.append(PiiDisclosure(
                         table=table.name, column=col.name,
@@ -194,6 +245,46 @@ class DisclosureReport:
             if count:
                 L.append(f"   {count:,} {what}")
 
+        # --- conditional structure ---
+        # Deliberately its own section rather than a line in the one above.
+        # Everything above is about which VALUES are in the file. This is
+        # about which COMBINATIONS are, which is a different and larger
+        # statement about the source, and it is new: it only appears when
+        # generation was conditioned on a discovered dependency.
+        if self.conditionals:
+            L.append("")
+            L.append(f" Conditional distributions embedded in this spec:"
+                     f" {len(self.conditionals)}")
+            for c in sorted(self.conditionals,
+                            key=lambda c: (-c.n_cells, c.dependent))[:10]:
+                note = "  (labels redacted)" if c.redacted else ""
+                L.append(f"     {c.qualified:<34} {c.n_keys:>5,} key(s),"
+                         f" {c.n_cells:>6,} cell(s){note}")
+            if len(self.conditionals) > 10:
+                L.append(f"     ... and {len(self.conditionals) - 10} more")
+            L.append(f"   {self.conditional_cells:,} cell(s) in total. A"
+                     f" conditional records which values CO-OCCUR")
+            L.append("   and in what proportion -- a contingency table of the"
+                     " source. That is")
+            L.append("   MORE than the marginal frequency vectors it sits"
+                     " beside, which record")
+            L.append("   only which values exist. It is what makes the"
+                     " synthetic data preserve")
+            L.append("   the source's structure, and it is a wider disclosure"
+                     " than not doing so.")
+            if self.suppressed_conditional_cells:
+                L.append(f"   {self.suppressed_conditional_cells:,} cell(s)"
+                         f" suppressed into '{OTHER_BUCKET_LABEL}' by"
+                         f" --min-cell-count.")
+            if any(c.redacted for c in self.conditionals):
+                L.append("   Redacted conditionals carry no real labels, but"
+                         " they still carry the")
+                L.append("   co-occurrence structure between the categories"
+                         " they stand for.")
+            L.append("   Turn this off with --no-condition-on-fds; the cost is"
+                     " that generated")
+            L.append("   data loses the relationships between these columns.")
+
         # --- PII ---
         L.append("")
         if self.pii:
@@ -258,6 +349,37 @@ class DisclosureReport:
                  " docs/disclosure.md")
         L.append(_RULE)
         return "\n".join(L)
+
+
+def _conditional_disclosure(table: str, col) -> ConditionalDisclosure:
+    """Measure the conditional table on a column, tolerating a broken one.
+
+    The notice has to render for any spec it is handed, including one a human
+    has edited into an inconsistent state -- refusing to print a disclosure
+    notice because the spec is malformed would suppress the notice exactly
+    when the file is least trustworthy.
+    """
+    params = col.params or {}
+    keys = params.get("keys") or []
+    values = params.get("values") or []
+    cells = 0
+    suppressed = 0
+    for row in values:
+        try:
+            cells += len(row)
+            suppressed += sum(1 for v in row if v == OTHER_BUCKET_LABEL)
+        except TypeError:
+            continue
+    prof_cat = col.profile.categorical if col.profile else None
+    return ConditionalDisclosure(
+        table=table,
+        determinant=[str(c) for c in (params.get("on") or [])],
+        dependent=col.name,
+        n_keys=len(keys),
+        n_cells=cells,
+        redacted=bool(prof_cat and prof_cat.redacted),
+        suppressed_cells=suppressed,
+    )
 
 
 def summarize(spec: Spec) -> DisclosureReport:
