@@ -493,12 +493,21 @@ def _normalize_weights(weights: Any, k: int) -> Optional[np.ndarray]:
     return w / total
 
 
-def _gen_vectorized(col: ColumnSpec, g: str, params: dict, n: int, rng_np) -> List[Any]:
+def _gen_vectorized(col: ColumnSpec, g: str, params: dict, n: int, rng_np,
+                    fk_index: Dict[str, List[Any]]) -> List[Any]:
     """Return a python list of ``n`` values for one vectorizable column."""
     if g == "const":
         return [params.get("value")] * n
     if g == "sequence":
         return list(range(1, n + 1))
+    if g == "fk":
+        ref = params.get("ref")
+        if not ref:
+            raise SpecError("fk generator requires params.ref (e.g. 'users.id')")
+        choices = fk_index.get(ref)
+        if choices is None or not choices:
+            raise SpecError(f"No parent key values found for fk ref '{ref}'")
+        return list(rng_np.choice(choices, size=n))
     if g == "uuid":
         return [str(uuid.uuid4()) for _ in range(n)]
     if g == "choice":
@@ -559,7 +568,7 @@ def _gen_vectorized(col: ColumnSpec, g: str, params: dict, n: int, rng_np) -> Li
     raise SpecError(f"Cannot vectorize generator '{g}'")
 
 
-def _build_table_vectorized(self, table, col_order, fk_cols, fk_rows,
+def _build_table_vectorized(self, table, col_order, fk_cols, fk_rows, fk_index,
                             parent_selectors, rng, rng_np, n) -> List[Dict[str, Any]]:
     """Generate every column of ``table`` in one column-wise pass."""
     col_values: Dict[str, List[Any]] = {}
@@ -581,7 +590,7 @@ def _build_table_vectorized(self, table, col_order, fk_cols, fk_rows,
 
     for col in col_order:
         g, params = resolve_generator(col)
-        vals = _gen_vectorized(col, g, params, n, rng_np)
+        vals = _gen_vectorized(col, g, params, n, rng_np, fk_index)
         if col.pii_strategy in ("mask", "redact", "hash"):
             vals = [_pii_transform(col.pii_strategy, v, col, None) for v in vals]
         nullable = col.constraints.get("nullable", True)
@@ -889,7 +898,8 @@ class GenerationEngine:
             used_vectorized = vectorized and _can_vectorize(table)
             if used_vectorized:
                 rows = _build_table_vectorized(
-                    self, table, col_order, fk_cols, fk_rows, parent_selectors,
+                    self, table, col_order, fk_cols, fk_rows, fk_index,
+                    parent_selectors,
                     rng, rng_np, table.row_count,
                 )
                 if stream_sink is not None and chunk_size is not None and not ordered_table:
