@@ -11,12 +11,15 @@ import pandas as pd
 
 from . import formats
 from . import generators
+from .disclosure import DisclosureReport
 from .engine import GenerationEngine, SpecError
 from .loaders import from_file, spec_to_dict, to_file
 from .profiler import (
     DEFAULT_MAX_CATEGORICAL,
     DEFAULT_MAX_CATEGORICAL_RATIO,
     DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
+    DEFAULT_MIN_CELL_COUNT,
+    RECOMMENDED_MIN_CELL_COUNT,
 )
 from .spec import Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings
 
@@ -156,6 +159,27 @@ def validate(spec_path: str) -> None:
                    f"{DEFAULT_MAX_CATEGORICAL_RATIO_CAP} distinct values). "
                    "Catches genuine categoricals that exceed "
                    "--max-categorical in absolute terms.")
+@click.option("--min-cell-count", "min_cell_count",
+              default=DEFAULT_MIN_CELL_COUNT, type=int, show_default=True,
+              help="Minimum cell-size suppression. Categorical values "
+                   "occurring fewer than K times IN THE SOURCE DATA are "
+                   "generalized into a single '__other__' bucket, preserving "
+                   "total frequency mass. Rare values are the ones that "
+                   "identify people (k-anonymity), so this is the control "
+                   f"that matters most. 0 disables it; {RECOMMENDED_MIN_CELL_COUNT} "
+                   "is the usual floor in published SDC practice. Left off by "
+                   "default because it changes the statistical content of the "
+                   "profile and that is the data holder's call -- but the "
+                   "disclosure summary reports what it would have caught "
+                   "either way.")
+@click.option("--redact-categoricals", "redact_categoricals", is_flag=True,
+              help="Replace categorical values in the written spec with "
+                   "opaque placeholder tokens (value_001, value_002, ...). "
+                   "Cardinality and the frequency vector are preserved, so "
+                   "generation still works; the value labels stop being "
+                   "derived from the source data. Use when the spec will be "
+                   "committed or shared and the category labels themselves "
+                   "are sensitive.")
 @click.option("--pii", "pii", default=None,
               help="Comma-separated column names to treat as PII.")
 @click.option("--pii-strategy", "pii_strategy", default="faker",
@@ -163,6 +187,7 @@ def validate(spec_path: str) -> None:
               help="Anonymization strategy for --pii columns.")
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             max_categorical: int, max_categorical_ratio: float,
+            min_cell_count: int, redact_categoricals: bool,
             pii: str, pii_strategy: str) -> None:
     """Profile one or more datasets into a Spec.
 
@@ -178,12 +203,15 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     from .profiler import DatasetProfiler
 
     pii_cols = [c.strip() for c in (pii or "").split(",") if c.strip()] or None
-    thresholds = dict(max_categorical=max_categorical,
-                      max_categorical_ratio=max_categorical_ratio)
+    # profiler options threaded through every construction path below
+    opts = dict(max_categorical=max_categorical,
+                max_categorical_ratio=max_categorical_ratio,
+                redact_categoricals=redact_categoricals,
+                min_cell_count=min_cell_count)
     if len(datasets) == 1:
         profiler = DatasetProfiler.from_file(
             datasets[0], name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy, **thresholds,
+            pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
         )
         spec = profiler.profile()
     else:
@@ -191,12 +219,12 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         for d in datasets:
             profiler = DatasetProfiler.from_file(
                 d, sample=sample, seed=seed, pii_columns=pii_cols,
-                pii_strategy=pii_strategy, **thresholds,
+                pii_strategy=pii_strategy, **opts,
             )
             dfs[profiler.name] = profiler.full
         spec = DatasetProfiler.profile_set(
             dfs, name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy, **thresholds,
+            pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
         )
     to_file(spec, out)
     n_rel = sum(len(t.relationships) for t in spec.tables)
@@ -205,6 +233,11 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         f"Profiled {len(datasets)} dataset(s) -> {out}: "
         f"{len(spec.tables)} table(s), {n_rel} relationship(s), {n_pii} PII column(s)"
     )
+    # The disclosure summary goes to stderr, deliberately. It is a notice about
+    # the artefact rather than part of it, and stderr is the stream that
+    # survives `syntab profile ... | tee`, redirection and CI log capture -- the
+    # situations in which someone is least likely to be reading closely.
+    click.echo(DisclosureReport.from_spec(spec).to_text(spec_path=out), err=True)
 
 
 def _read_any(path: str) -> pd.DataFrame:

@@ -46,6 +46,7 @@ syntab validate  --spec spec.yaml
 syntab list-generators
 syntab init > spec.yaml
 syntab profile data.csv --out spec.yaml --name my_table --sample 5000
+syntab profile data.csv --out spec.yaml --min-cell-count 5 --redact-categoricals
 ```
 
 ## Profiling an existing dataset
@@ -374,6 +375,45 @@ proven row engine, so correctness is never sacrificed:
   * self-referencing relationships (the parent pool grows as rows are emitted);
   * many-to-many junctions (links are precomputed);
   * uniqueness constraints or composite primary keys.
+
+## Disclosure posture (read before committing a profiled spec)
+**A profiled spec is derived from your source data. Treat it as data, not as
+source code, and review it before committing or sharing it.**
+
+`syntab profile` embeds real source values in the spec it writes: the distinct
+values and exact frequencies of every categorical column, the true min/max of
+every numeric column, real first/last timestamps, and a character pattern taken
+from real strings. That is what makes the profiling round trip work — but it
+means the spec is derived data, and the repository `.gitignore` treats it that
+way.
+
+Every `syntab profile` run now prints a disclosure summary to stderr saying how
+many real values from how many columns landed in the file, which columns were
+flagged PII and by which signal, and whether the controls below were applied.
+
+Two controls, both standard statistical-disclosure-control techniques:
+
+```bash
+# generalize categorical values occurring fewer than K times in the SOURCE
+# into an "__other__" bucket. Rare values are the identifying ones.
+syntab profile data.parquet --out spec.yaml --min-cell-count 5
+
+# replace categorical labels with opaque tokens, keeping cardinality and the
+# frequency vector — so the spec still generates and still conforms.
+syntab profile data.parquet --out spec.yaml --redact-categoricals
+```
+
+`--min-cell-count` defaults to `0` (off), because enabling suppression silently
+changes the statistical content of every profile and that is the data holder's
+decision. The summary reports how many values fall below the recommended
+threshold of 5 either way, so the decision is put in front of you rather than
+made for you.
+
+Synthetic data is **not** automatically anonymous — a generator that faithfully
+reproduces a two-member category reproduces the fact that those two people
+exist. See **[docs/disclosure.md](docs/disclosure.md)** for what the spec
+contains field by field, what the controls do, the known residual risks
+(numeric extremes, histogram bin edges, id-like columns), and references.
 
 ## Spec format
 See `examples/spec.yaml` (hand-authored) and `examples/spec_profiled.json`
