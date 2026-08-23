@@ -49,6 +49,23 @@ class NumericProfile(BaseModel):
 class CategoricalProfile(BaseModel):
     values: Dict[str, float] = Field(default_factory=dict)  # value -> frequency
     null_rate: float = 0.0
+    # True when ``values`` holds placeholder tokens rather than real source
+    # values (profiled with --redact-categoricals). The frequency vector and
+    # the cardinality are still real -- that is what generation needs -- but
+    # the value labels carry no information from the source data. Recorded so
+    # a reader of the spec, and `syntab compare`, can tell the difference.
+    redacted: bool = False
+    # Minimum cell-size suppression (--min-cell-count). ``min_cell_count`` is
+    # the K that was applied, None when none was; ``suppressed_values`` is how
+    # many distinct source values were generalized into the "__other__" bucket.
+    min_cell_count: Optional[int] = None
+    suppressed_values: int = 0
+    # How many of the values embedded above occur fewer than
+    # profiler.RECOMMENDED_MIN_CELL_COUNT (5) times in the source data. These
+    # are the values that carry the re-identification risk: a category with one
+    # member identifies that member. Recorded even when no suppression was
+    # applied, precisely so that a spec which needs review says so on its face.
+    rare_value_count: int = 0
 
 
 class ColumnProfile(BaseModel):
@@ -82,6 +99,13 @@ class ColumnSpec(BaseModel):
     # anonymization strategy applied at generation time:
     # faker | mask | redact | hash  (None -> no special handling)
     pii_strategy: Optional[str] = None
+    # Which detection signal(s) flagged this column, in the profiler's
+    # vocabulary: "explicit" (named in --pii), "column-name", "value-pattern".
+    # Recorded because they warrant different follow-up -- a value-pattern hit
+    # is evidence about the data, a column-name hit is an inference from a
+    # label that may be wrong in either direction. None when not profiled or
+    # not flagged, so it is omitted from a serialized spec entirely.
+    pii_detected_by: Optional[List[str]] = None
     description: Optional[str] = None
     profile: Optional[ColumnProfile] = None
 
