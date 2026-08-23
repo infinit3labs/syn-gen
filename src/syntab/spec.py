@@ -25,6 +25,16 @@ class SpecMetadata(BaseModel):
     owner: Optional[str] = None
     created_at: Optional[datetime] = None
     license: Optional[str] = None
+    # The syntab package version that emitted the spec. Recorded by the
+    # profiler (``syntab.__version__``) so a reviewer can tell whether a spec
+    # was written by a version that still produced the behaviour it claims
+    # to. ``None`` on hand-authored specs.
+    syntab_version: Optional[str] = None
+    # The merge report from the most recent ``--merge-into`` profile, when
+    # one ran. A dict (not a Pydantic model) so the per-call summary is free
+    # to evolve without a spec-version bump. ``None`` on hand-authored specs
+    # and on profiles that did not use ``--merge-into``.
+    merge: Optional[Dict[str, Any]] = None
 
 
 class InferenceProvenance(BaseModel):
