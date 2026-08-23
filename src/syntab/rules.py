@@ -13,10 +13,23 @@ Syntax (no eval, hand-written tokenizer + recursive-descent parser):
   unary     := "-" unary | postfix
   postfix   := primary ("." name)*
   primary   := number | string | bool | null | ident | func_call | "(" or_expr ")"
+  ident     := bare_ident | quoted_ident
+  bare_ident:= [A-Za-z_][A-Za-z0-9_]*
+  quoted_id := "`" (any char | "``") + "`"
 
 Identifiers: ``col`` (current row) or ``alias.col`` (parent table via FK alias,
 e.g. ``user.region``). Functions: abs, min, max, len, lower, upper, coalesce,
 days_between, now.
+
+A column whose name is not a bare identifier -- ``ZIP code``,
+``Timely response?``, ``Sub-product`` -- is written in backticks:
+``` `ZIP code` == '02139' ```. A literal backtick inside one is doubled, as in
+SQL. Use :func:`quote_identifier` to produce the right form for a name rather
+than deciding by hand.
+
+Backticks rather than double quotes because ``"..."`` already means a string
+literal here; redefining it would silently change what every existing spec
+means.
 """
 from __future__ import annotations
 
@@ -40,11 +53,18 @@ from typing import Any, Dict, List, Optional
 # `trueup`, `falsework`, `nulls_allowed` -- silently parsed as something else
 # entirely. Alternation order cannot fix it; only matching the whole word
 # first and then asking what it is can.
+#
+# QIDENT sits ahead of IDENT, which is safe for exactly the reason the literal
+# alternatives were not: a backtick cannot begin a bare identifier, so the two
+# alternatives cannot match overlapping prefixes of the same input. The
+# keyword/literal classification below still applies to whole words only, and
+# never to a quoted name -- `true` in backticks is a column called "true".
 _TOKEN_RE = re.compile(
     r"""
     (?P<WS>\s+)
   | (?P<NUMBER>\d+\.\d+|\d+)
   | (?P<STRING>'[^']*'|"[^"]*")
+  | (?P<QIDENT>`(?:[^`]|``)*`)
   | (?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<OP><=|>=|==|!=|<|>|\+|-|\*|/|%|\(|\)|\.|,)
     """,
@@ -54,6 +74,26 @@ _TOKEN_RE = re.compile(
 KEYWORDS = {"if", "then", "else", "and", "or", "not"}
 BOOL_LITERALS = {"true", "false"}
 NULL_LITERALS = {"null"}
+
+_BARE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED = KEYWORDS | BOOL_LITERALS | NULL_LITERALS
+
+
+def quote_identifier(name: str) -> str:
+    """Render ``name`` as an identifier this DSL will read back as ``name``.
+
+    Plain identifiers are returned unchanged, so generated rule text stays
+    readable and existing specs keep the shape they have. Anything else --
+    spaces, punctuation, a leading digit, the empty string, or a word the
+    tokenizer would classify as a keyword or literal -- comes back in
+    backticks with any embedded backtick doubled.
+
+    Anything that builds rule text from a column name should go through this
+    rather than deciding for itself; the profiler does.
+    """
+    if _BARE_IDENT_RE.match(name or "") and name not in _RESERVED:
+        return name
+    return "`" + (name or "").replace("`", "``") + "`"
 
 
 @dataclass
@@ -80,6 +120,10 @@ def tokenize(s: str) -> List[Token]:
             tokens.append(Token("NUMBER", text))
         elif kind == "STRING":
             tokens.append(Token("STRING", text[1:-1]))
+        elif kind == "QIDENT":
+            # A quoted name is a column name and nothing else: it is never
+            # reclassified as a keyword or a literal, and never a function.
+            tokens.append(Token("QIDENT", text[1:-1].replace("``", "`")))
         elif kind == "IDENT":
             # whole word matched; now decide what it is
             if text in KEYWORDS:
@@ -112,6 +156,10 @@ class Literal(Node):
 @dataclass
 class Ident(Node):
     name: str
+    # True when the name was written in backticks. Kept because a quoted name
+    # is opaque: ```a.b``` is one column called "a.b", not column "b" of
+    # parent alias "a", and :func:`_lookup` must not split it on the dot.
+    quoted: bool = False
 
 
 @dataclass
@@ -176,6 +224,19 @@ class Parser:
             raise ValueError(f"Expected {kind} {value!r} but got {t}")
         return self.next()
 
+    def at_keyword(self, word: str) -> bool:
+        """Whether the next token is the keyword ``word``.
+
+        The kind matters as much as the text. Before quoted identifiers
+        existed the tokenizer guaranteed that a token spelled ``if`` was the
+        keyword, so testing ``value`` alone was safe; now ```if``` is a
+        perfectly good column name that arrives as QIDENT with the same text.
+        Testing text alone would parse ```if` == 1`` as a malformed
+        if-expression.
+        """
+        t = self.peek()
+        return t is not None and t.kind == "KW" and t.value == word
+
     def parse(self) -> Node:
         node = self.parse_if()
         if self.i != len(self.toks):
@@ -183,13 +244,13 @@ class Parser:
         return node
 
     def parse_if(self) -> Node:
-        if self.peek() and self.peek().value == "if":  # type: ignore[union-attr]
+        if self.at_keyword("if"):
             self.next()
             cond = self.parse_or()
             self.expect("KW", "then")
             then = self.parse_or()
             els = None
-            if self.peek() and self.peek().value == "else":  # type: ignore[union-attr]
+            if self.at_keyword("else"):
                 self.next()
                 els = self.parse_or()
             return IfExpr(cond, then, els)
@@ -197,7 +258,7 @@ class Parser:
 
     def parse_or(self) -> Node:
         left = self.parse_and()
-        while self.peek() and self.peek().value == "or":  # type: ignore[union-attr]
+        while self.at_keyword("or"):
             self.next()
             right = self.parse_and()
             left = BinOp("or", left, right)
@@ -205,14 +266,14 @@ class Parser:
 
     def parse_and(self) -> Node:
         left = self.parse_not()
-        while self.peek() and self.peek().value == "and":  # type: ignore[union-attr]
+        while self.at_keyword("and"):
             self.next()
             right = self.parse_not()
             left = BinOp("and", left, right)
         return left
 
     def parse_not(self) -> Node:
-        if self.peek() and self.peek().value == "not":  # type: ignore[union-attr]
+        if self.at_keyword("not"):
             self.next()
             return Unary("not", self.parse_not())
         return self.parse_comparison()
@@ -255,8 +316,10 @@ class Parser:
         node = self.parse_primary()
         while self.peek() and self.peek().kind == "OP" and self.peek().value == ".":  # type: ignore[union-attr]
             self.next()
-            name = self.expect("IDENT").value
-            node = Attr(node, name)
+            t = self.peek()
+            if t is None or t.kind not in ("IDENT", "QIDENT"):
+                raise ValueError(f"Expected an identifier after '.' but got {t}")
+            node = Attr(node, self.next().value)
         return node
 
     def parse_primary(self) -> Node:
@@ -281,6 +344,12 @@ class Parser:
             node = self.parse_or()
             self.expect("OP", ")")
             return node
+        if t.kind == "QIDENT":
+            # Deliberately never a function call: quoting says "this is the
+            # name of a column", so ```abs`(1)`` is a syntax error rather
+            # than a call to abs().
+            self.next()
+            return Ident(t.value, quoted=True)
         if t.kind == "IDENT":
             self.next()
             if self.peek() and self.peek().kind == "OP" and self.peek().value == "(":
@@ -334,8 +403,9 @@ def _truthy(v: Any) -> bool:
     return bool(v)
 
 
-def _lookup(name: str, ctx: Dict[str, Any], parents: Dict[str, Dict[str, Any]]) -> Any:
-    if "." in name:
+def _lookup(name: str, ctx: Dict[str, Any], parents: Dict[str, Dict[str, Any]],
+            quoted: bool = False) -> Any:
+    if "." in name and not quoted:
         head, _, rest = name.partition(".")
         if head in parents:
             obj = parents[head]
@@ -355,7 +425,7 @@ def _eval_node(node: Node, ctx: Dict[str, Any], parents: Dict[str, Dict[str, Any
     if isinstance(node, Literal):
         return node.value
     if isinstance(node, Ident):
-        return _lookup(node.name, ctx, parents)
+        return _lookup(node.name, ctx, parents, node.quoted)
     if isinstance(node, Attr):
         base = _eval_node(node.base, ctx, parents)
         if base is None:
