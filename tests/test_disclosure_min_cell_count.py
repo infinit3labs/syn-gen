@@ -96,8 +96,14 @@ def test_helper_preserves_total_mass():
 # through the profiler
 # ---------------------------------------------------------------------------
 
-def test_suppression_is_off_by_default():
-    cat = _cat(_frame())
+def test_zero_turns_suppression_off():
+    """Renamed from test_suppression_is_off_by_default.
+
+    The behaviour asserted is unchanged and is still worth asserting -- it is
+    now reached by passing 0 rather than by passing nothing, because the
+    default is K=5. tests/test_min_cell_count_default.py covers the default.
+    """
+    cat = _cat(_frame(), min_cell_count=0)
     assert cat.min_cell_count is None
     assert cat.suppressed_values == 0
     assert OTHER_BUCKET_LABEL not in cat.values
@@ -105,8 +111,12 @@ def test_suppression_is_off_by_default():
 
 
 def test_rare_values_are_counted_even_when_suppression_is_off():
-    """The whole point: a spec that needs review says so on its face."""
-    cat = _cat(_frame())
+    """The whole point: a spec that needs review says so on its face.
+
+    Pinned to K=0 so the rare values still exist to be counted; the count is
+    reported whether or not suppression ran, which is what this asserts.
+    """
+    cat = _cat(_frame(), min_cell_count=0)
     # gamma (4), delta (2), epsilon (1) are all below the recommended 5
     assert cat.rare_value_count == 3
 
@@ -208,8 +218,10 @@ def test_cli_exposes_min_cell_count(tmp_path):
     _frame().to_csv(data, index=False)
     runner = CliRunner()
 
+    # K=0: the explicit opt-out, which is now what "no suppression" requires
     plain = tmp_path / "plain.yaml"
-    res = runner.invoke(cli, ["profile", str(data), "--out", str(plain)])
+    res = runner.invoke(cli, ["profile", str(data), "--out", str(plain),
+                              "--min-cell-count", "0"])
     assert res.exit_code == 0, res.output
     assert "epsilon" in plain.read_text(encoding="utf-8")
 

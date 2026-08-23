@@ -16,7 +16,19 @@ def _df():
 
 
 def test_profiler_basic():
-    prof = DatasetProfiler(_df(), name="t", sample=None)
+    # min_cell_count=0 is pinned explicitly, not inherited.
+    #
+    # This test is about dtype inference, generator selection and key
+    # detection. It is not about disclosure control. Its 5-row frame has
+    # status = active x3, inactive x2, so with the default K=5 both cells fall
+    # below the threshold and the column collapses to a single '__other__'
+    # bucket -- which would make the categorical assertions below fail for a
+    # reason that has nothing to do with what they are checking.
+    #
+    # Pinning K=0 here keeps the test measuring what it was written to measure
+    # and stops it silently re-breaking whenever the disclosure default moves.
+    # The default itself is covered in tests/test_min_cell_count_default.py.
+    prof = DatasetProfiler(_df(), name="t", sample=None, min_cell_count=0)
     spec = prof.profile()
     tbl = spec.tables[0]
     by_name = {c.name: c for c in tbl.columns}
