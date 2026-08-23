@@ -192,6 +192,13 @@ column. Both are distributional summaries, so `quality` samples 50,000 rows by
 default (`--sample`, `--sample 0` to disable). SDMetrics exposes the same
 control as `num_rows_subsample`.
 
+There is also a default budget of 1,000 column pairs. That evaluates every
+pair through 45 non-text columns, so ordinary-width tables retain their prior
+behavior. Wider tables score a deterministic sample of eligible pairs,
+selected from the report seed; the text and JSON reports disclose the total
+eligible count, scored count, and truncation. Library callers can pass
+`max_pair_trends=None` when they explicitly need the unbounded calculation.
+
 ## Text generation
 
 Un-suppressing the text metrics surfaced a real defect, which is fixed in the
