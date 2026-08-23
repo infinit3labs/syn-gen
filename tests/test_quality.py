@@ -148,6 +148,22 @@ def test_pair_trends_property_is_actually_populated():
         "CorrelationSimilarity", "ContingencySimilarity"}
 
 
+def test_pair_trends_are_bounded_and_disclose_wide_table_truncation():
+    """Wide tables score a deterministic subset instead of all column pairs."""
+    real = pd.DataFrame({f"c{i}": np.arange(40) + i for i in range(20)})
+    report = quality_report(real, real, max_pair_trends=25)
+
+    trends = report.get_property("Column Pair Trends")
+    assert len(trends.results) == 25
+    assert report.pair_trends_total == 190
+    assert report.pair_trends_scored == 25
+    assert report.pair_trends_truncated is True
+    assert "25 of 190" in report.to_text()
+    assert report.to_dict()["pair_trends"] == {
+        "total": 190, "scored": 25, "truncated": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Individual metric definitions
 # ---------------------------------------------------------------------------
