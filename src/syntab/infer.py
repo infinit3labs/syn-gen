@@ -6,7 +6,7 @@ re-synthesized compatibly.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .generators import empirical_text_params
 from .spec import ColumnProfile, ColumnSpec, Spec
@@ -118,6 +118,23 @@ def resolve_generator(col: ColumnSpec) -> Tuple[Optional[str], dict]:
         "uuid": "uuid",
     }.get(col.dtype, "string")
     return default, params
+
+
+def conditional_determinants(col: ColumnSpec) -> List[str]:
+    """Columns a ``conditional`` generator reads out of the current row.
+
+    A conditional column cannot be generated until its determinant has been,
+    so this is a generation dependency in exactly the sense ``depends_on``
+    means. Reading it from ``params.on`` rather than requiring the author to
+    restate it in ``depends_on`` means a hand-written spec cannot be silently
+    wrong -- forgetting the restatement would otherwise produce a column
+    ordered arbitrarily and sampled from its fallback marginal, which looks
+    plausible and is the exact failure this whole change exists to remove.
+    """
+    gen, params = resolve_generator(col)
+    if gen != "conditional":
+        return []
+    return [str(c) for c in (params.get("on") or [])]
 
 
 def fit_text_params(spec: Spec, frames: Dict[str, Any]) -> Spec:
