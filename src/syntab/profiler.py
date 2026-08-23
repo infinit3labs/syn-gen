@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import datetime as _dt
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import re
 
 from .spec import (
     CategoricalProfile,
@@ -31,7 +31,7 @@ from .spec import (
     TableSpec,
 )
 
-_UUID_RE = __import__("re").compile(
+_UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
@@ -68,6 +68,55 @@ def _string_pattern(values: List[str]) -> str:
     return "".join(out)
 
 
+# Identifier tokenization. Splits snake_case, kebab-case, space-separated and
+# camelCase/PascalCase names into word tokens while keeping runs of capitals
+# together, so "Complaint ID" -> ["Complaint", "ID"] and "userId" ->
+# ["user", "Id"]. This is the conventional identifier-splitting alternation;
+# the order matters, because the all-caps run has to be tried before the
+# single-capital-then-lowercase form.
+_NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+# Trailing tokens that mark a column as an identifier.
+_ID_TOKENS = {"id", "uuid", "guid"}
+
+# Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
+DEFAULT_MAX_CATEGORICAL = 50
+DEFAULT_MAX_CATEGORICAL_RATIO = 0.05
+DEFAULT_MAX_CATEGORICAL_RATIO_CAP = 500
+
+
+def _name_tokens(name: str) -> List[str]:
+    return _NAME_TOKEN_RE.findall(name or "")
+
+
+def _is_id_like(name: str) -> bool:
+    """Whether a column name ends in an identifier *token*.
+
+    Substring matching -- ``name.lower().endswith("id")`` -- is wrong here. It
+    accepts ``paid``, ``void``, ``valid``, ``bid``, ``grid``, ``rapid``,
+    ``humid``, ``squid`` and anything else that happens to end in those two
+    letters, and a float column called ``paid`` was being promoted to primary
+    key ahead of the real one. Tokenizing the name and testing only the final
+    token fixes the whole class of false positives at once, and removes the
+    need for the per-dataset exception ("complaint id") that had been added to
+    paper over one instance of it.
+    """
+    tokens = _name_tokens(name)
+    return bool(tokens) and tokens[-1].lower() in _ID_TOKENS
+
+
+def _id_base(name: str) -> Optional[str]:
+    """For an id-like name, the normalized prefix before the id token.
+
+    ``user_id`` / ``userId`` / ``User ID`` -> ``user``. Returns None when the
+    name is a bare identifier (``id``) or is not id-like at all.
+    """
+    tokens = _name_tokens(name)
+    if len(tokens) < 2 or tokens[-1].lower() not in _ID_TOKENS:
+        return None
+    return "_".join(t.lower() for t in tokens[:-1])
+
+
 class DatasetProfiler:
     def __init__(
         self,
@@ -76,7 +125,9 @@ class DatasetProfiler:
         source: Optional[str] = None,
         sample: Optional[int] = 5000,
         seed: Optional[int] = None,
-        max_categorical: int = 50,
+        max_categorical: int = DEFAULT_MAX_CATEGORICAL,
+        max_categorical_ratio: float = DEFAULT_MAX_CATEGORICAL_RATIO,
+        max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
     ):
@@ -86,6 +137,8 @@ class DatasetProfiler:
         self.sample = sample
         self.seed = seed
         self.max_categorical = max_categorical
+        self.max_categorical_ratio = max_categorical_ratio
+        self.max_categorical_ratio_cap = max_categorical_ratio_cap
         self.pii_columns = set(pii_columns or [])
         self.pii_strategy = pii_strategy
 
@@ -162,16 +215,43 @@ class DatasetProfiler:
         )
 
     def _build_table_spec(self, df: pd.DataFrame, name: str, source: str) -> TableSpec:
-        if self.sample and len(df) > self.sample:
-            df = df.sample(n=self.sample, random_state=self.seed)
-        n = len(df)
+        source_rows = len(df)
+        if self.sample and source_rows > self.sample:
+            sdf = df.sample(n=self.sample, random_state=self.seed)
+        else:
+            sdf = df
+        n = len(sdf)
         cols: List[ColumnSpec] = []
         for c in df.columns:
-            spec = self._profile_column(str(c), df[c], n)
+            # The sample drives the expensive shape work; the full column is
+            # passed alongside it so facts that must be true of the whole
+            # dataset (nullability, uniqueness) are checked against all of it.
+            spec = self._profile_column(str(c), sdf[c], full=df[c])
             if spec is not None:
                 cols.append(spec)
         pk = self._detect_pk(cols)
-        return TableSpec(name=name, row_count=n, primary_key=pk, columns=cols)
+        # ``row_count`` is the size of the SOURCE dataset, not of whatever
+        # sample we happened to read. It is the contract "a dataset of this
+        # shape has this many rows", and ``syntab check`` compares generated
+        # output against it. Recording the sample size here silently shrank
+        # every profiled dataset to --sample rows, and the conformance check
+        # then certified the truncated result as correct.
+        #
+        # How much was actually read is provenance, so it is recorded
+        # separately under ``metadata.profiling``. Nothing compares against it.
+        return TableSpec(
+            name=name,
+            row_count=source_rows,
+            primary_key=pk,
+            columns=cols,
+            metadata={
+                "profiling": {
+                    "source_row_count": source_rows,
+                    "sampled_rows": n,
+                    "sampled": n < source_rows,
+                }
+            },
+        )
 
     @classmethod
     def profile_set(
@@ -180,7 +260,9 @@ class DatasetProfiler:
         name: Optional[str] = None,
         sample: Optional[int] = 5000,
         seed: Optional[int] = None,
-        max_categorical: int = 50,
+        max_categorical: int = DEFAULT_MAX_CATEGORICAL,
+        max_categorical_ratio: float = DEFAULT_MAX_CATEGORICAL_RATIO,
+        max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
     ) -> Spec:
@@ -192,7 +274,10 @@ class DatasetProfiler:
         recorded as ``metadata.suggested_depends_on`` hints (non-breaking).
         """
         profilers = {
-            t: cls(df, name=t, sample=sample, seed=seed, max_categorical=max_categorical,
+            t: cls(df, name=t, sample=sample, seed=seed,
+                   max_categorical=max_categorical,
+                   max_categorical_ratio=max_categorical_ratio,
+                   max_categorical_ratio_cap=max_categorical_ratio_cap,
                    pii_columns=pii_columns, pii_strategy=pii_strategy)
             for t, df in tables.items()
         }
@@ -218,8 +303,59 @@ class DatasetProfiler:
         )
 
     @staticmethod
+    def _value_kind(s: pd.Series) -> str:
+        """Coarse comparability class of a column, for foreign-key matching.
+
+        Two columns are only candidates for a key relationship if they hold
+        the same kind of value. Note that ``is_numeric_dtype`` is true of a
+        boolean column, so bool has to be tested first.
+        """
+        if pd.api.types.is_bool_dtype(s):
+            return "bool"
+        if pd.api.types.is_numeric_dtype(s):
+            return "numeric"
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return "datetime"
+        return "string"
+
+    @classmethod
+    def _key_values(cls, s: pd.Series) -> set:
+        """The distinct key values of a column, compared on their own type.
+
+        This used to be ``{str(v) for v in col.dropna().unique()}`` on both
+        sides of the containment test, which is wrong in both directions:
+
+        * a nullable foreign key is held by pandas in a float64 column, so a
+          child value of 1 stringifies to ``"1.0"`` while the parent's int64 1
+          stringifies to ``"1"``. The subset test failed and the relationship
+          was silently dropped -- and a nullable FK is the ordinary case, not
+          an edge case;
+        * in the other direction, columns of genuinely different types could
+          be matched because their string forms happened to coincide.
+
+        So: integral numerics are normalized to int, and columns of different
+        kinds are never compared at all.
+        """
+        s = s.dropna()
+        kind = cls._value_kind(s)
+        if kind == "bool":
+            return set(s.astype(bool).tolist())
+        if kind == "numeric":
+            vals = s.astype("float64")
+            # 2**53 is the largest integer float64 represents exactly. Past
+            # that the float is already lossy, so narrowing to int would be
+            # inventing precision rather than recovering it.
+            if len(vals) and bool((vals % 1 == 0).all()) \
+                    and float(vals.abs().max()) < 2 ** 53:
+                return set(vals.astype("int64").tolist())
+            return set(vals.tolist())
+        if kind == "datetime":
+            return set(pd.to_datetime(s).tolist())
+        return set(s.astype(str).tolist())
+
+    @classmethod
     def _infer_relationships(
-        table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
+        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
     ) -> Dict[str, List[RelationshipSpec]]:
         rels: Dict[str, List[RelationshipSpec]] = {t: [] for t in table_specs}
         names = set(table_specs)
@@ -227,73 +363,156 @@ class DatasetProfiler:
             cdf = dfs[cname]
             for col in cts.columns:
                 colname = col.name
-                if colname == "id" or not colname.endswith("_id"):
+                if colname not in cdf.columns:
                     continue
-                base = colname[:-3]
-                candidates = [b for b in (base, base + "s", base.rstrip("s"))
+                # Token-aware, so camelCase and spaced names work too; returns
+                # None for a bare "id" or a non-identifier name.
+                base = _id_base(colname)
+                if not base:
+                    continue
+                singular = base[:-1] if base.endswith("s") else base
+                candidates = [b for b in (base, base + "s", singular)
                               if b in names and b != cname]
                 if not candidates:
                     continue
-                child_vals = {str(v) for v in cdf[colname].dropna().unique()}
+                child = cdf[colname]
+                child_vals = cls._key_values(child)
                 if not child_vals:
                     continue
+                child_kind = cls._value_kind(child)
                 for pname in candidates:
-                    pts = table_specs[pname]
-                    pkp = pts.primary_key
-                    if not pkp:
+                    pkp = table_specs[pname].primary_key
+                    if not isinstance(pkp, str):
+                        continue  # no key, or a composite one
+                    pdf = dfs[pname]
+                    if pkp not in pdf.columns:
                         continue
-                    parent_vals = {str(v) for v in dfs[pname][pkp].dropna().unique()}
-                    if child_vals.issubset(parent_vals):
+                    parent = pdf[pkp]
+                    if cls._value_kind(parent) != child_kind:
+                        continue
+                    if child_vals.issubset(cls._key_values(parent)):
                         rels[cname].append(RelationshipSpec(
                             **{"from": colname, "to": f"{pname}.{pkp}", "alias": pname}
                         ))
                         break
         return rels
 
-    @staticmethod
+    # |r| above which two numeric columns are reported as related.
+    _DEPENDS_ON_R = 0.95
+
+    @classmethod
     def _infer_depends_on(
-        table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
+        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
     ) -> None:
+        """Record strongly correlated numeric column pairs as a hint.
+
+        This was a double loop running ``df[[a, b]].dropna().corr()`` once per
+        pair: O(C^2) pandas round-trips, each slicing a two-column frame,
+        copying it, dropping rows and building a 2x2 result, to read a single
+        number off it -- for a quantity the whole correlation matrix produces
+        in one call. 40 numeric columns meant 780 of those.
+
+        ``DataFrame.corr`` uses pairwise-complete observations, which is
+        exactly what the per-pair ``dropna()`` was doing, so the values are
+        unchanged; ``tests/test_profiler_depends_on.py`` asserts equivalence
+        against a reference implementation of the old loop.
+
+        NOTE: the output of this method -- ``metadata.suggested_depends_on``
+        -- is read by nothing in this package. Not the generation engine, not
+        ``infer.resolve_generator``, not the conformance checker, not the CLI.
+        It is computed, written into the spec, serialized, and never consulted.
+        It is kept here rather than deleted because whether it should become a
+        real feature (feeding ``ColumnSpec.depends_on``) or be dropped is a
+        product decision, not a correctness fix.
+        """
         for t, cts in table_specs.items():
             df = dfs[t]
-            num_cols = [c.name for c in cts.columns if c.dtype in ("int", "float")]
+            num_cols = [c.name for c in cts.columns
+                        if c.dtype in ("int", "float") and c.name in df.columns]
+            if len(num_cols) < 2:
+                continue
+
+            matrix = df[num_cols].corr(numeric_only=True)
+            cols = list(matrix.columns)
+            if len(cols) < 2:
+                continue
+            # A constant column correlates with nothing and yields NaN; treat
+            # that as "no relationship" rather than letting it propagate.
+            values = np.nan_to_num(np.abs(matrix.to_numpy()), nan=0.0)
+
+            rows, cols_idx = np.triu_indices(len(cols), k=1)
+            strong = values[rows, cols_idx] > cls._DEPENDS_ON_R
+
             sugg: Dict[str, List[str]] = {}
-            for i, a in enumerate(num_cols):
-                for b in num_cols[i + 1:]:
-                    if a not in df.columns or b not in df.columns:
-                        continue
-                    try:
-                        r = df[[a, b]].dropna().corr().iloc[0, 1]
-                    except Exception:
-                        r = 0
-                    if r is not None and abs(float(r)) > 0.95:
-                        sugg.setdefault(a, []).append(b)
-                        sugg.setdefault(b, []).append(a)
+            for i, j in zip(rows[strong], cols_idx[strong]):
+                a, b = cols[int(i)], cols[int(j)]
+                sugg.setdefault(a, []).append(b)
+                sugg.setdefault(b, []).append(a)
+
             if sugg:
                 md = dict(cts.metadata or {})
                 md["suggested_depends_on"] = sugg
                 cts.metadata = md
 
     # ----- internals -----
-    def _profile_column(self, name: str, series: pd.Series, n: int) -> Optional[ColumnSpec]:
+    @staticmethod
+    def _validate_unique(sample: pd.Series, full: Optional[pd.Series]) -> bool:
+        """Decide uniqueness by candidate generation + validation.
+
+        The sample can only ever *nominate* a candidate. Any column with more
+        distinct values than the sample size is unique within a sample draw by
+        construction, which is precisely the set of high-cardinality columns
+        someone would want to test for keyhood -- so a sample-only verdict is
+        wrong exactly where it matters. This is the structure sampling-based
+        dependency discovery uses (HyFD and its descendants): cheap sampling
+        proposes candidates, then every candidate is confirmed against the
+        full data before it is believed.
+
+        Validation is ``pandas.Series.is_unique`` -- one hash-table pass, and
+        far cheaper than the sort a hand-rolled check would reach for. Nulls
+        are dropped first to match the conformance checker, which follows SQL
+        in not treating repeated NULLs as duplicate key values.
+        """
+        if len(sample) == 0:
+            return False
+        if int(sample.nunique()) != len(sample):
+            return False  # not even a candidate
+        if full is None:
+            return True
+        return bool(full.dropna().is_unique)
+
+    def _profile_column(self, name: str, series: pd.Series,
+                        full: Optional[pd.Series] = None) -> Optional[ColumnSpec]:
         s = series.dropna()
-        null_rate = round(1 - len(s) / n, 4) if n else 1.0
         if len(s) == 0:
             return None  # fully-null column: skip
 
+        # Nullability comes from the FULL column, never the sample. A column
+        # that is null in one row per million shows zero nulls in a 5k draw;
+        # the profiler then wrote ``nullable: false``, and ``syntab check``
+        # hard-failed the source dataset against its own spec on the first
+        # real null. ``isna().sum()`` is a single vectorized pass, so there is
+        # no performance reason to have approximated this from a sample.
+        stats_src = full if full is not None else series
+        total = len(stats_src)
+        n_nulls = int(stats_src.isna().sum())
+        null_rate = round(n_nulls / total, 4) if total else 1.0
+
         dtype, profile = self._infer_type_and_profile(s)
         params: dict = {}
-        constraints: dict = {"nullable": null_rate > 0, "null_rate": null_rate}
+        constraints: dict = {"nullable": n_nulls > 0, "null_rate": null_rate}
 
-        # uniqueness
-        n_unique = int(s.nunique())
-        unique = n_unique == len(s) and len(s) > 0
+        # uniqueness: nominated on the sample, confirmed on the full column
+        unique = self._validate_unique(s, full)
         if unique:
             constraints["unique"] = True
 
         generator = "auto"
-        # integer id-like sequential column -> sequence
-        if dtype == "int" and unique and self._looks_sequential(s):
+        # Integer id-like sequential column -> sequence. Also decided on the
+        # full column: a random sample of a contiguous sequence has gaps, so
+        # asking the sample can only ever produce a false negative here.
+        seq_src = full.dropna() if full is not None else s
+        if dtype == "int" and unique and self._looks_sequential(seq_src):
             generator = "sequence"
 
         spec = ColumnSpec(
@@ -361,10 +580,12 @@ class DatasetProfiler:
 
         # categorical vs free text
         n_unique = int(vals.nunique())
-        ratio = n_unique / len(vals)
-        if ratio < 0.5 and n_unique <= self.max_categorical:
+        if self._is_categorical(n_unique, len(vals)):
             counts = vals.value_counts()
-            chosen = counts.head(self.max_categorical)
+            # _is_categorical already bounds n_unique; head() is a belt-and-
+            # braces guard so a future caller cannot make the profiler write an
+            # unbounded number of real values into a spec file.
+            chosen = counts.head(self._categorical_value_cap)
             total = float(chosen.sum())
             values = {str(k): round(float(v) / total, 4) for k, v in chosen.items()}
             return "str", ColumnProfile(
@@ -377,6 +598,44 @@ class DatasetProfiler:
         if lengths.max() <= 30:
             prof.string_pattern = _string_pattern(vals.head(50).tolist())
         return "str", prof
+
+    @property
+    def _categorical_value_cap(self) -> int:
+        """Hard ceiling on how many distinct values may be written to a spec."""
+        return max(self.max_categorical, self.max_categorical_ratio_cap)
+
+    def _is_categorical(self, n_unique: int, n: int) -> bool:
+        """Decide categorical vs free text for a string column.
+
+        Two independent tests, either of which is sufficient.
+
+        Absolute: at most ``max_categorical`` distinct values, and fewer than
+        half the rows. This is the original rule and it covers the small fixed
+        domain -- a status, a country code, a response category. The 0.5 guard
+        stops a tiny frame whose rows are nearly all distinct from being
+        called categorical.
+
+        Ratio: the distinct count is at most ``max_categorical_ratio`` of the
+        rows, capped at ``max_categorical_ratio_cap`` distinct values. A fixed
+        absolute cutoff is simply wrong at scale -- 300 distinct product codes
+        across 5M rows is unambiguously categorical, but 300 > 50, so the
+        column fell through to the free-text branch and was re-synthesized as
+        random characters with the right string length and nothing else. Low
+        cardinality *relative to row count* is the standard way to make that
+        call; the cap is what keeps the emitted spec bounded in size, and
+        bounds how many real values it embeds.
+
+        Raising ``max_categorical`` increases the number of real source values
+        written verbatim into the spec file. That is the intended trade-off,
+        but it is a disclosure trade-off, not only a fidelity one.
+        """
+        if n <= 0:
+            return False
+        ratio = n_unique / n
+        if n_unique <= self.max_categorical and ratio < 0.5:
+            return True
+        return (ratio <= self.max_categorical_ratio
+                and n_unique <= self.max_categorical_ratio_cap)
 
     def _numeric_profile(self, s: pd.Series) -> NumericProfile:
         smin = float(s.min())
@@ -447,14 +706,22 @@ class DatasetProfiler:
             return False
 
     def _detect_pk(self, cols: List[ColumnSpec]) -> Optional[str]:
-        candidates = [c for c in cols if c.constraints.get("unique")]
+        # A primary key is UNIQUE *and* NOT NULL. Only the first half was
+        # being checked, so a unique-but-nullable column could be nominated
+        # and would then fail the conformance checker's own PK check, because
+        # pandas' ``duplicated`` counts repeated NaNs as duplicates where SQL
+        # UNIQUE does not.
+        candidates = [
+            c for c in cols
+            if c.constraints.get("unique")
+            and not c.constraints.get("nullable", True)
+        ]
         if not candidates:
             return None
         for c in candidates:
-            low = c.name.lower()
-            if low in ("id", "complaint id") or low.endswith("id") or low.endswith("_id"):
+            if _is_id_like(c.name):
                 return c.name
-        # otherwise first unique integer column
+        # otherwise first unique integer/string column
         for c in candidates:
             if c.dtype in ("int", "str"):
                 return c.name

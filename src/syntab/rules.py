@@ -30,21 +30,30 @@ from typing import Any, Dict, List, Optional
 # Tokenizer
 # ---------------------------------------------------------------------------
 
+# Word-like tokens are matched by ONE alternative -- the identifier rule --
+# and classified afterwards against the keyword/literal tables below. This is
+# the standard maximal-munch-plus-keyword-table lexer design, and it is the
+# design because the alternative does not work: listing `true|false|null` as
+# their own regex alternatives ahead of the identifier rule makes the engine
+# match a *prefix* of a longer word. `nullable == true` tokenized as
+# NULL + IDENT("able"), so a rule about a column named `nullable` -- or
+# `trueup`, `falsework`, `nulls_allowed` -- silently parsed as something else
+# entirely. Alternation order cannot fix it; only matching the whole word
+# first and then asking what it is can.
 _TOKEN_RE = re.compile(
     r"""
     (?P<WS>\s+)
   | (?P<NUMBER>\d+\.\d+|\d+)
   | (?P<STRING>'[^']*'|"[^"]*")
-  | (?P<BOOL>true|false)
-  | (?P<NULL>null)
   | (?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<OP><=|>=|==|!=|<|>|\+|-|\*|/|%|\(|\)|\.|,)
-  | (?P<KW>if|then|else|and|or|not)
     """,
     re.VERBOSE,
 )
 
 KEYWORDS = {"if", "then", "else", "and", "or", "not"}
+BOOL_LITERALS = {"true", "false"}
+NULL_LITERALS = {"null"}
 
 
 @dataclass
@@ -65,21 +74,20 @@ def tokenize(s: str) -> List[Token]:
         text = m.group()
         if kind == "WS":
             continue
-        if kind == "KW":
-            tokens.append(Token(text, text))
-        elif kind == "OP":
+        if kind == "OP":
             tokens.append(Token("OP", text))
-        elif kind == "BOOL":
-            tokens.append(Token("BOOL", text))
-        elif kind == "NULL":
-            tokens.append(Token("NULL", text))
         elif kind == "NUMBER":
             tokens.append(Token("NUMBER", text))
         elif kind == "STRING":
             tokens.append(Token("STRING", text[1:-1]))
         elif kind == "IDENT":
+            # whole word matched; now decide what it is
             if text in KEYWORDS:
                 tokens.append(Token("KW", text))
+            elif text in BOOL_LITERALS:
+                tokens.append(Token("BOOL", text))
+            elif text in NULL_LITERALS:
+                tokens.append(Token("NULL", text))
             else:
                 tokens.append(Token("IDENT", text))
         else:

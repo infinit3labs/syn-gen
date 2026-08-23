@@ -125,10 +125,21 @@ def validate_against_spec(
         else:
             checks.append(Check(table.name, "all spec columns present", "pass"))
 
-        # row count
+        # Row count is compared against ``table.row_count``, which for a
+        # profiled spec is the size of the SOURCE dataset. How many rows the
+        # profiler actually read lives under ``metadata.profiling.sampled_rows``
+        # and is provenance only -- it is never the target, so it must not be
+        # compared against. It is surfaced in the message so an operator can
+        # tell a genuine mismatch from a profiling artefact.
         if table.row_count is not None and len(df) != table.row_count:
-            checks.append(Check(table.name, "row count matches spec", "warn",
-                                 f"spec={table.row_count} actual={len(df)}"))
+            detail = f"spec={table.row_count} actual={len(df)}"
+            profiling = (table.metadata or {}).get("profiling") or {}
+            if profiling.get("sampled"):
+                detail += (
+                    f" (spec row_count is the profiled source size; "
+                    f"{profiling.get('sampled_rows')} rows were sampled to build it)"
+                )
+            checks.append(Check(table.name, "row count matches spec", "warn", detail))
         else:
             checks.append(Check(table.name, "row count matches spec", "pass"))
 
