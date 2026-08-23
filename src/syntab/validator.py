@@ -4,12 +4,38 @@ For each column we compute a distributional distance and a pass/warn/fail
 status against configurable thresholds:
 
   * numeric / datetime -> Kolmogorov-Smirnov statistic D (supremum difference
-    of empirical CDFs), computed without external deps.
+    of empirical CDFs).
   * categorical / boolean -> Total Variation Distance (0.5 * sum |p_i - q_i|).
-  * text / string -> length-statistic distance + character-distribution TVD
-    (structural similarity only; free text cannot be matched semantically).
+  * text / string -> length-statistic distance + character-distribution TVD.
 
 The report aggregates per-column results and an overall verdict.
+
+Scope
+-----
+This module is MARGINALS-ONLY by construction: it compares each column
+against its counterpart in isolation and says nothing about the
+relationships between columns. That is a real limit, not an oversight, and
+it is the reason :mod:`syntab.quality` exists -- a dataset can pass every
+check here while every correlation in it has been destroyed. Use
+:func:`syntab.quality.quality_report` for a graded fidelity score including
+column pair trends, and :func:`syntab.quality.diagnostic_report` for
+structural validity. This remains as the quick per-column pass/warn/fail
+gate, and shares its metric primitives with that module so the two cannot
+drift apart.
+
+A note on text columns
+----------------------
+Text results used to be suppressed: a ``fail`` was rewritten to ``warn``,
+and text columns were excluded from the overall verdict, on the rationale
+that free text "cannot be matched semantically". Both suppressions are gone.
+
+The rationale did not describe the metrics actually being computed. Neither
+the length-mean difference nor the character-distribution TVD is semantic;
+both are structural, and both are precisely what a broken text generator
+gets wrong. A check that computes the right number and then declines to act
+on it is worse than no check at all, because it issues a clean bill of
+health it holds the evidence to contradict. Text columns now fail like any
+other column.
 """
 from __future__ import annotations
 
@@ -19,6 +45,13 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from .quality import (
+    _char_frequencies as _char_freqs,
+    _ks_statistic,
+    _tvd,
+    _value_frequencies as _freqs,
+    infer_kind as _infer_kind,
+)
 from .spec import Spec
 
 
@@ -59,6 +92,7 @@ class ValidationReport:
             f"  pass={self.n_pass}  warn={self.n_warn}  fail={self.n_fail}  "
             f"mean_distance={self.mean_distance:.4f}",
             f"  OVERALL: {'PASS' if self.overall_pass else 'FAIL'}",
+            "  (marginals only -- see `syntab quality` for pair trends)",
             "-" * 72,
             f"{'column':<28}{'kind':<12}{'metric':<8}{'dist':<8}{'thr':<8}status",
             "-" * 72,
@@ -69,45 +103,6 @@ class ValidationReport:
                 f"{c.threshold:<8.2f}{c.status}"
             )
         return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Distance helpers
-# ---------------------------------------------------------------------------
-
-def _ks_statistic(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.sort(np.asarray(a, dtype=float))
-    b = np.sort(np.asarray(b, dtype=float))
-    if len(a) == 0 or len(b) == 0:
-        return 1.0
-    grid = np.concatenate([a, b])
-    cdf_a = np.searchsorted(a, grid, side="right") / len(a)
-    cdf_b = np.searchsorted(b, grid, side="right") / len(b)
-    return float(np.max(np.abs(cdf_a - cdf_b)))
-
-
-def _tvd(p: Dict[Any, float], q: Dict[Any, float]) -> float:
-    keys = set(p) | set(q)
-    return 0.5 * sum(abs(p.get(k, 0.0) - q.get(k, 0.0)) for k in keys)
-
-
-def _freqs(series: pd.Series) -> Dict[Any, float]:
-    vc = series.value_counts(dropna=True)
-    total = float(vc.sum())
-    if total == 0:
-        return {}
-    return {str(k): float(v) / total for k, v in vc.items()}
-
-
-def _char_freqs(series: pd.Series) -> Dict[str, float]:
-    text = "".join(series.dropna().astype(str).tolist())
-    if not text:
-        return {}
-    counts: Dict[str, float] = {}
-    for ch in text:
-        counts[ch] = counts.get(ch, 0.0) + 1.0
-    total = float(sum(counts.values()))
-    return {k: v / total for k, v in counts.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -168,45 +163,37 @@ def _compare_datetime(real: pd.Series, synth: pd.Series, thr: Dict[str, float]):
 
 
 def _compare_text(real: pd.Series, synth: pd.Series, thr: Dict[str, float]):
+    """Compare two text columns structurally.
+
+    Two metrics, both structural, neither semantic:
+
+      * ``len_mean_diff`` -- relative difference in mean value length. Catches
+        a generator emitting every value at one length.
+      * ``char_tvd`` -- total variation distance between the character-unigram
+        distributions. Catches a generator drawing from the wrong alphabet.
+
+    The worse of the two is the reported distance, and it is reported
+    honestly: a text column fails like any other column.
+    """
     rl = real.dropna().astype(str).str.len()
     sl = synth.dropna().astype(str).str.len()
     len_mean_diff = abs(float(rl.mean()) - float(sl.mean())) / max(1.0, float(rl.mean()))
     char_tvd = _tvd(_char_freqs(real), _char_freqs(synth))
     d = max(len_mean_diff, char_tvd)
     status = "pass" if d <= thr["pass"] else ("warn" if d <= thr["warn"] else "fail")
-    # Free text cannot be matched semantically -> never a hard fail.
-    if status == "fail":
-        status = "warn"
     details = {
         "real_len_mean": float(rl.mean()),
         "synth_len_mean": float(sl.mean()),
+        "len_mean_diff": len_mean_diff,
         "char_tvd": char_tvd,
-        "note": "structural only; free text is not matched semantically",
+        "note": "structural comparison of length and character distributions",
     }
     return d, status, details
 
 
 # ---------------------------------------------------------------------------
-# Kind inference + orchestration
+# Orchestration
 # ---------------------------------------------------------------------------
-
-def _infer_kind(series: pd.Series) -> str:
-    if pd.api.types.is_bool_dtype(series.dtype):
-        return "boolean"
-    if pd.api.types.is_numeric_dtype(series.dtype):
-        return "numeric"
-    s = series.dropna().astype(str)
-    try:
-        parsed = pd.to_datetime(series, errors="coerce", format="mixed")
-    except (ValueError, TypeError):
-        parsed = pd.to_datetime(series, errors="coerce")
-    if parsed.notna().mean() > 0.8:
-        return "datetime"
-    n_unique = s.nunique()
-    if n_unique / max(1, len(s)) < 0.5 and n_unique <= 50:
-        return "categorical"
-    return "text"
-
 
 _DEFAULT_THRESHOLDS = {
     "numeric": {"pass": 0.1, "warn": 0.2},
@@ -261,8 +248,7 @@ def validate(
     n_pass = sum(1 for c in reports if c.status == "pass")
     n_warn = sum(1 for c in reports if c.status == "warn")
     n_fail = sum(1 for c in reports if c.status == "fail")
-    # Free-text columns are structural-only and never hard-fail the verdict.
-    overall = all(c.status != "fail" for c in reports if c.kind != "text")
+    overall = all(c.status != "fail" for c in reports)
     return ValidationReport(
         columns=reports,
         real_rows=len(real),

@@ -19,10 +19,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from . import discovery
 from .spec import (
     CategoricalProfile,
     ColumnProfile,
     ColumnSpec,
+    InferenceProvenance,
     NumericProfile,
     RelationshipSpec,
     Settings,
@@ -195,10 +197,138 @@ def _redact_categorical_values(values: Dict[str, float]) -> Dict[str, float]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Structure discovery
+# ---------------------------------------------------------------------------
+# Keys, foreign keys and column dependencies are discovered with the published
+# algorithms in ``syntab.discovery`` (HyFD, Pyro, HyUCC, SPIDER) rather than
+# inferred from column names. Discovery needs the optional ``[discovery]``
+# extra; when it is absent the profiler falls back to the name-based rules
+# that preceded it and says so in the provenance it records, so a spec always
+# states which of the two produced each rule.
+#
+# ``None`` means "use discovery if it is installed". Pass True to make its
+# absence an error, False to force the fallback.
+DEFAULT_DISCOVER = None
+
+# Widest candidate key the profiler will adopt as a primary key. A discovered
+# 5-column unique combination is real and is almost never the table's key.
+MAX_KEY_COLUMNS = 3
+
+# Cap on composite unique constraints written into a spec. Populating
+# ``unique_constraints`` turns off the engine's vectorized generation path
+# (see engine._is_vectorizable), so the profiler emits only genuinely
+# composite ones -- single-column uniqueness already travels as
+# ``constraints.unique``, which does not cost the fast path -- and only a
+# handful of them.
+MAX_COMPOSITE_UNIQUE_CONSTRAINTS = 3
+
+# Functional-dependency discovery is OFF by default, and that is a considered
+# choice rather than caution. FD discovery is the most expensive thing in this
+# module -- on the 208k-row CFPB source it is the difference between a 3.3 s
+# and a 20.7 s profile -- and unlike key and foreign-key discovery its output
+# does not currently steer generation (see the commit that removed
+# ``suggested_depends_on`` for exactly why it cannot yet). Paying six times the
+# profiling cost by default for a report nothing consumes would be the wrong
+# trade; paying it on request, to understand a dataset before editing its spec,
+# is a good one.
+DEFAULT_DISCOVER_FDS = False
+
+# Cap on functional dependencies recorded in a spec, strongest first. A wide
+# table can yield hundreds; a spec is something a human reads and edits.
+MAX_RECORDED_FDS = 50
+
+# Conditional generation: turning a discovered dependency into an instruction
+# to generation rather than a line in a report.
+#
+# This is the half of dependency discovery that was missing. Discovery found
+# that Sub-product determines Product on the CFPB source and recorded it;
+# generation then sampled the two columns independently and the hierarchy came
+# out destroyed -- 0.16 on the pair against 0.98 and 0.96 on the marginals.
+# When this is on, a column on the receiving end of a selected dependency is
+# generated with the ``conditional`` generator, drawing from the observed
+# P(dependent | determinant) instead of from its own marginal.
+#
+# ON by default when --discover-fds is on, and only then. Discovering FDs is
+# already an explicit request that costs real time; having made it, the useful
+# thing to do with the answer is act on it. Someone who wants the report
+# without the behaviour change passes --no-condition-on-fds.
+DEFAULT_CONDITION_ON_FDS = True
+
+# Widest determinant a conditional generator will be given. One, and the
+# reason is disclosure as much as file size: a conditional table over a
+# k-column determinant records the joint frequency of every observed
+# (x1..xk, y) combination, which for k >= 2 approaches publishing the source
+# contingency table itself. One determinant keeps it at O(|X| * |Y|) -- the
+# same order as the two marginals it replaces -- and on real hierarchies it is
+# where almost all of the fidelity is.
+MAX_CONDITIONAL_LHS = 1
+
+
 # Categorical-vs-free-text thresholds. See DatasetProfiler._is_categorical.
 DEFAULT_MAX_CATEGORICAL = 50
 DEFAULT_MAX_CATEGORICAL_RATIO = 0.05
 DEFAULT_MAX_CATEGORICAL_RATIO_CAP = 500
+
+
+class _NamedKey:
+    """Stand-in for a discovered UCC when discovery did not run.
+
+    Lets the primary-key selection run one code path whether the evidence came
+    from HyUCC or from the per-column uniqueness check that preceded it.
+    """
+
+    __slots__ = ("columns",)
+
+    def __init__(self, columns: Tuple[str, ...]):
+        self.columns = columns
+
+
+def _fingerprint(value: Any) -> str:
+    """Stable digest of a value the profiler wrote into a spec.
+
+    Recorded on the provenance so a later re-profile can tell its own previous
+    output from a human edit. See ``merge_preserving_edits``.
+    """
+    import hashlib
+    import json
+
+    payload = json.dumps(value, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _table_name_forms(table: str) -> set:
+    """The base names a foreign-key column could carry for ``table``.
+
+    ``users`` is referenced by ``user_id`` as often as by ``users_id``, so the
+    singular and plural are both accepted. Used only to break a tie between
+    equally well-covered candidate parents.
+    """
+    low = table.lower()
+    forms = {low, low + "s"}
+    if low.endswith("s"):
+        forms.add(low[:-1])
+    return forms
+
+
+def _would_cycle(edges: set, child: str, parent: str) -> bool:
+    """Whether adding child -> parent closes a cycle in the table graph.
+
+    The engine generates a parent table before its children and raises on a
+    cyclic spec, so a pair of tables whose keys happen to contain each other
+    must not both become foreign keys.
+    """
+    seen = {parent}
+    stack = [parent]
+    while stack:
+        node = stack.pop()
+        if node == child:
+            return True
+        for a, b in edges:
+            if a == node and b not in seen:
+                seen.add(b)
+                stack.append(b)
+    return False
 
 
 def _name_tokens(name: str) -> List[str]:
@@ -433,6 +563,104 @@ def pii_name_signal(name: str) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Re-profiling without destroying hand edits
+# ---------------------------------------------------------------------------
+# Profiling is meant to be iterative: profile, read the spec, correct what the
+# algorithms got wrong, profile again with a better sample or a looser
+# threshold. Until now the second step threw away the third -- ``profile``
+# writes a whole new file and every correction went with it, which makes the
+# loop unusable and is why people stop after one pass.
+#
+# The mechanism is drift detection, not a diff. Each inferred rule is written
+# with a fingerprint of the value the profiler itself produced. On a re-profile
+# the fingerprint is compared against what the spec now says:
+#
+#   value == fingerprint   -> nobody touched it; the new inference wins
+#   value != fingerprint   -> a human changed it; keep the human's value and
+#                             mark it human_edited so it is never silently
+#                             re-inferred again
+#   no provenance at all   -> hand-authored, or written before this existed;
+#                             keep it, on the principle that an unexplained
+#                             rule is more likely a person's than a machine's
+#
+# Scope: this covers what discovery writes -- the primary key and the
+# relationships. Column-level edits (a corrected dtype, a pii flag, an edited
+# categorical distribution) are NOT preserved yet; see the PR description.
+
+
+def _provenance_is_stale(prov, current_value) -> bool:
+    """Whether ``current_value`` differs from what the profiler last wrote."""
+    if prov is None or not prov.fingerprint:
+        return False
+    return prov.fingerprint != _fingerprint(current_value)
+
+
+def _mark_edited(prov: Optional[InferenceProvenance]) -> InferenceProvenance:
+    if prov is None:
+        return InferenceProvenance(algorithm="human", human_edited=True)
+    updated = prov.model_copy(deep=True)
+    updated.human_edited = True
+    return updated
+
+
+def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
+    """Fold a fresh profile into an existing spec, keeping human corrections.
+
+    Returns a new Spec; neither argument is mutated. Tables and relationships
+    the fresh profile found but the existing spec does not have are added --
+    the point of re-profiling is to learn something new, so a merge that only
+    ever preserved would be as useless as one that only ever overwrote.
+    """
+    merged = profiled.model_copy(deep=True)
+    old_tables = {t.name: t for t in existing.tables}
+
+    for table in merged.tables:
+        old = old_tables.get(table.name)
+        if old is None:
+            continue
+
+        # ----- primary key -----
+        keep_key = (
+            old.primary_key is not None
+            and (old.key_provenance is None
+                 or old.key_provenance.human_edited
+                 or _provenance_is_stale(old.key_provenance, old.primary_key))
+        )
+        if keep_key:
+            table.primary_key = old.primary_key
+            table.key_provenance = _mark_edited(old.key_provenance)
+
+        # ----- relationships, matched on the child column(s) -----
+        old_rels = {tuple(r.child_columns): r for r in old.relationships}
+        kept: Dict[tuple, RelationshipSpec] = {}
+        for key, rel in old_rels.items():
+            # The fingerprint a discovered relationship carries is over
+            # [child column, "parent.column"], so that is what is re-derived.
+            edited = (
+                rel.provenance is None
+                or rel.provenance.human_edited
+                or _provenance_is_stale(rel.provenance, [rel.from_, rel.to])
+            )
+            if edited:
+                preserved = rel.model_copy(deep=True)
+                preserved.provenance = _mark_edited(rel.provenance)
+                kept[key] = preserved
+
+        fresh = [r for r in table.relationships
+                 if tuple(r.child_columns) not in kept]
+        table.relationships = list(kept.values()) + fresh
+
+    # Tables the existing spec has and the fresh profile does not are kept:
+    # a source that was not re-read is not a source that went away.
+    profiled_names = {t.name for t in merged.tables}
+    for name, old in old_tables.items():
+        if name not in profiled_names:
+            merged.tables.append(old.model_copy(deep=True))
+
+    return merged
+
+
 class DatasetProfiler:
     def __init__(
         self,
@@ -448,6 +676,15 @@ class DatasetProfiler:
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
+        discover: Optional[bool] = DEFAULT_DISCOVER,
+        discover_fds: bool = DEFAULT_DISCOVER_FDS,
+        fd_error: float = discovery.DEFAULT_FD_ERROR,
+        fd_min_mu: float = discovery.DEFAULT_MIN_MU,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+        discovery_sample_rows: int = discovery.DEFAULT_SAMPLE_ROWS,
+        discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
+        condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
+        conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
     ):
         self.full = df
         self.name = name or "profiled"
@@ -461,9 +698,26 @@ class DatasetProfiler:
         self.pii_strategy = pii_strategy
         self.redact_categoricals = redact_categoricals
         self.min_cell_count = max(0, int(min_cell_count))
+        if discover is True and not discovery.is_available():
+            discovery.require_desbordante()  # raises with an actionable message
+        self.discover = (
+            discovery.is_available() if discover is None else bool(discover)
+        )
+        self.discover_fds = bool(discover_fds) and self.discover
+        self.fd_error = fd_error
+        self.fd_min_mu = fd_min_mu
+        self.ind_error = ind_error
+        self.discovery_sample_rows = discovery_sample_rows
+        self.discovery_max_lhs = discovery_max_lhs
+        # Conditioning is only meaningful when FDs were actually discovered.
+        self.condition_on_fds = bool(condition_on_fds) and self.discover_fds
+        self.conditional_fd_error = conditional_fd_error
         # id-like columns whose base name looks identifying (patient_id). Not
         # auto-flagged -- see pii_name_signal -- but surfaced for review.
         self.identifying_key_candidates: List[str] = []
+        # column -> {real label: placeholder}, populated only when
+        # --redact-categoricals is on. See _conditional_generation.
+        self._redaction_maps: Dict[str, Dict[str, str]] = {}
 
     # ----- PII helpers -----
     #
@@ -574,7 +828,11 @@ class DatasetProfiler:
             spec = self._profile_column(str(c), sdf[c], full=df[c])
             if spec is not None:
                 cols.append(spec)
-        pk = self._detect_pk(cols)
+        uccs = self._discover_uccs(df)
+        pk, key_prov = self._detect_pk(cols, uccs, source_rows)
+        unique_constraints = self._composite_unique_constraints(uccs, pk)
+        fds = self._discover_fds(df)
+        conditionals = self._apply_conditional_generation(df, cols, pk)
         # ``row_count`` is the size of the SOURCE dataset, not of whatever
         # sample we happened to read. It is the contract "a dataset of this
         # shape has this many rows", and ``syntab check`` compares generated
@@ -588,7 +846,9 @@ class DatasetProfiler:
             name=name,
             row_count=source_rows,
             primary_key=pk,
+            key_provenance=key_prov,
             columns=cols,
+            unique_constraints=unique_constraints,
             metadata={
                 "profiling": {
                     "source_row_count": source_rows,
@@ -602,7 +862,12 @@ class DatasetProfiler:
                     **({"identifying_key_candidates":
                         list(self.identifying_key_candidates)}
                        if self.identifying_key_candidates else {}),
-                }
+                },
+                **({"discovery": {
+                    **({"functional_dependencies": fds} if fds else {}),
+                    **({"conditional_dependencies": conditionals}
+                       if conditionals else {}),
+                }} if (fds or conditionals) else {}),
             },
         )
 
@@ -620,13 +885,23 @@ class DatasetProfiler:
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
+        discover: Optional[bool] = DEFAULT_DISCOVER,
+        discover_fds: bool = DEFAULT_DISCOVER_FDS,
+        fd_error: float = discovery.DEFAULT_FD_ERROR,
+        fd_min_mu: float = discovery.DEFAULT_MIN_MU,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+        discovery_sample_rows: int = discovery.DEFAULT_SAMPLE_ROWS,
+        discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
+        condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
+        conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
     ) -> Spec:
-        """Profile several related tables and infer foreign-key relationships.
+        """Profile several related tables and discover foreign keys.
 
-        Relationship inference matches a column ``<parent>_id`` to a table whose
-        name matches ``<parent>`` (or its plural) and whose primary-key values
-        are a superset of the column's values. Strong numeric correlations are
-        recorded as ``metadata.suggested_depends_on`` hints (non-breaking).
+        Foreign keys come from inclusion dependencies found by SPIDER
+        (Bauckmann, Leser, Naumann & Tietz, ICDE 2007), not from column names.
+        See ``_relationships_from_inds`` for how an IND becomes a foreign key,
+        and ``_relationships_from_names`` for the name-based rule that is now
+        only the fallback for when the optional discovery extra is absent.
         """
         profilers = {
             t: cls(df, name=t, sample=sample, seed=seed,
@@ -635,17 +910,28 @@ class DatasetProfiler:
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
                    pii_columns=pii_columns, pii_strategy=pii_strategy,
                    redact_categoricals=redact_categoricals,
-                   min_cell_count=min_cell_count)
+                   min_cell_count=min_cell_count,
+                   discover=discover, discover_fds=discover_fds,
+                   fd_error=fd_error, fd_min_mu=fd_min_mu,
+                   ind_error=ind_error,
+                   discovery_sample_rows=discovery_sample_rows,
+                   discovery_max_lhs=discovery_max_lhs,
+                   condition_on_fds=condition_on_fds,
+                   conditional_fd_error=conditional_fd_error)
             for t, df in tables.items()
         }
         table_specs = {
             t: profilers[t]._build_table_spec(df, t, f"profiled:{t}")
             for t, df in tables.items()
         }
-        rels = cls._infer_relationships(table_specs, tables)
+        any_profiler = next(iter(profilers.values()), None)
+        use_discovery = bool(any_profiler and any_profiler.discover)
+        rels = cls._infer_relationships(
+            table_specs, tables,
+            use_discovery=use_discovery, ind_error=ind_error,
+        )
         for t, rel_list in rels.items():
             table_specs[t].relationships = rel_list
-        cls._infer_depends_on(table_specs, tables)
         meta = SpecMetadata(
             name=name or "profiled_set",
             description="Profiled from multiple related tables",
@@ -666,14 +952,12 @@ class DatasetProfiler:
         Two columns are only candidates for a key relationship if they hold
         the same kind of value. Note that ``is_numeric_dtype`` is true of a
         boolean column, so bool has to be tested first.
+
+        Delegates to ``discovery.value_kind``: the same rule now also has to
+        gate what is handed to SPIDER and what is believed of its output, and
+        two copies of a type-compatibility rule drift.
         """
-        if pd.api.types.is_bool_dtype(s):
-            return "bool"
-        if pd.api.types.is_numeric_dtype(s):
-            return "numeric"
-        if pd.api.types.is_datetime64_any_dtype(s):
-            return "datetime"
-        return "string"
+        return discovery.value_kind(s)
 
     @classmethod
     def _key_values(cls, s: pd.Series) -> set:
@@ -710,10 +994,249 @@ class DatasetProfiler:
             return set(pd.to_datetime(s).tolist())
         return set(s.astype(str).tolist())
 
+    # ----- foreign keys -----------------------------------------------
+    #
+    # A foreign key is an inclusion dependency whose referenced side is a key.
+    # That is the definition, and it is also the primary discriminating
+    # feature in the published work on picking foreign keys out of a set of
+    # INDs (Rostin, Albrecht, Bauckmann, Naumann & Leser, "A Machine Learning
+    # Approach to Foreign Key Discovery", WebDB 2009). SPIDER supplies the
+    # INDs; the rules below decide which of them are foreign keys.
+
     @classmethod
     def _infer_relationships(
+        cls,
+        table_specs: Dict[str, "TableSpec"],
+        dfs: Dict[str, pd.DataFrame],
+        *,
+        use_discovery: bool = True,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+    ) -> Dict[str, List[RelationshipSpec]]:
+        """Foreign keys, from inclusion dependencies where possible.
+
+        Falls back to the name-based rule when the discovery extra is absent,
+        recording ``algorithm="name-heuristic"`` on the provenance so a spec
+        never overstates the evidence behind a relationship.
+        """
+        if use_discovery and discovery.is_available():
+            try:
+                return cls._relationships_from_inds(
+                    table_specs, dfs, ind_error=ind_error
+                )
+            except discovery.DiscoveryUnavailable:
+                pass
+        return cls._relationships_from_names(table_specs, dfs)
+
+    @staticmethod
+    def _normalize_key_column(s: pd.Series) -> pd.Series:
+        """Put a column into the form key comparison happens in.
+
+        Integral numerics are narrowed to a nullable integer so a nullable
+        foreign key -- which pandas holds as float64, making 1 into "1.0" --
+        compares equal to an int64 parent key of "1". This is the same
+        normalization ``_key_values`` performs for the name-based path, moved
+        upstream of SPIDER because SPIDER compares the values itself.
+
+        2**53 is the largest integer float64 represents exactly; past it the
+        float is already lossy, so narrowing would invent precision.
+        """
+        kind = discovery.value_kind(s)
+        if kind != "numeric":
+            return s
+        vals = pd.to_numeric(s, errors="coerce").astype("Float64")
+        nn = vals.dropna()
+        if len(nn) and bool((nn % 1 == 0).all()) and float(nn.abs().max()) < 2 ** 53:
+            return vals.astype("Int64")
+        return vals
+
+    @classmethod
+    def _ind_candidate_columns(
+        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
+    ) -> Dict[str, List[str]]:
+        """Which columns are worth handing to SPIDER.
+
+        The promotion rule below only ever accepts an IND whose PARENT side is
+        a table's primary key, so the referenced side of the search space is
+        exactly the set of primary-key columns. A column is therefore a useful
+        candidate only if it is a primary key, or if some other table's
+        primary key could contain it. Two necessary conditions decide that:
+
+          * same value kind -- the type-compatibility pruning introduced by
+            the P0 work, kept because it is sound and cheap;
+          * no more distinct values than the parent key has. Containment
+            cannot hold otherwise, so this discards nothing real.
+
+        On the CFPB source the second condition is what keeps the 202,516
+        distinct free-text narratives out of a sort-merge over every column.
+        This is a pre-filter on the candidate set. Recall now comes from
+        SPIDER, not from a rule about column names.
+        """
+        keys: Dict[str, Tuple[str, str, int]] = {}
+        for name, ts in table_specs.items():
+            pk = ts.primary_key
+            if not isinstance(pk, str) or pk not in dfs[name].columns:
+                continue
+            col = dfs[name][pk]
+            keys[name] = (pk, discovery.value_kind(col), int(col.nunique(dropna=True)))
+
+        out: Dict[str, List[str]] = {}
+        for name, df in dfs.items():
+            own_pk = keys.get(name, (None,))[0]
+            chosen: List[str] = []
+            for c in df.columns:
+                c = str(c)
+                if c == own_pk:
+                    chosen.append(c)
+                    continue
+                kind = discovery.value_kind(df[c])
+                distinct = int(df[c].nunique(dropna=True))
+                if distinct == 0:
+                    continue
+                if any(pk_kind == kind and distinct <= pk_distinct
+                       for other, (_, pk_kind, pk_distinct) in keys.items()
+                       if other != name):
+                    chosen.append(c)
+            if chosen:
+                out[name] = chosen
+        return out
+
+    @classmethod
+    def _relationships_from_inds(
+        cls,
+        table_specs: Dict[str, "TableSpec"],
+        dfs: Dict[str, pd.DataFrame],
+        *,
+        ind_error: float = discovery.DEFAULT_IND_ERROR,
+    ) -> Dict[str, List[RelationshipSpec]]:
+        """Promote SPIDER's inclusion dependencies to foreign keys.
+
+        An IND ``child.c SUBSET-OF parent.p`` becomes a foreign key when:
+
+        1. ``p`` IS the parent table's primary key. This is what a foreign key
+           means, and it is the feature that does nearly all the work: on the
+           CFPB source it is what rejects the reverse INDs (a dimension's
+           values are trivially contained in the fact column they came from)
+           and the accidental ones between two unconstrained fact columns.
+        2. ``c`` is NOT the child table's own primary key. A mutual inclusion
+           between two primary keys is a one-to-one correspondence with no
+           direction the data can settle, and asserting one at random is worse
+           than asserting none. This deliberately declines some real 1:1
+           foreign keys; see the report.
+        3. the two columns have the same value kind. SPIDER compares values
+           after its own conversion, so the string "1" is contained in an
+           integer column of 1s. The type-compatibility rule from the P0 work
+           rejects that, here as a post-filter as well as a pre-filter.
+        4. the tables differ. An intra-table IND into the table's own key is a
+           self-reference, which the engine supports but only with the extra
+           settings (nullable key, root_fraction, max_depth) that make a
+           hierarchy terminate. Inferring one without them produces a spec
+           that fails validation, so it is left to a human. Called out in the
+           report rather than inferred.
+
+        When a child column is contained in several primary keys, the one with
+        the highest COVERAGE -- distinct child values over distinct parent key
+        values -- wins. Coverage is one of the features Rostin et al. (WebDB
+        2009) rank foreign-key candidates on: a child column that uses almost
+        all of a key is far more likely to reference it than one that touches
+        a handful of a much larger key's values. Column NAME breaks a
+        remaining tie and nothing more, exactly as it does for primary keys.
+
+        Finally, edges that would make the inter-table graph cyclic are
+        dropped lowest-coverage-first: the engine generates parents before
+        children and cannot satisfy a cycle.
+        """
+        frames = {t: df for t, df in dfs.items() if len(df) > 0}
+        columns = cls._ind_candidate_columns(table_specs, frames)
+        normalized = {
+            t: pd.DataFrame(
+                {c: cls._normalize_key_column(frames[t][c]) for c in cols}
+            )
+            for t, cols in columns.items()
+        }
+        if not normalized:
+            return {t: [] for t in table_specs}
+
+        inds = discovery.discover_inclusion_dependencies(
+            normalized, error=ind_error
+        )
+
+        pk_of = {
+            name: ts.primary_key if isinstance(ts.primary_key, str) else None
+            for name, ts in table_specs.items()
+        }
+        scored: List[Tuple[float, bool, Any]] = []
+        for ind in inds:
+            if ind.child_table == ind.parent_table:
+                continue                                        # rule 4
+            if pk_of.get(ind.parent_table) != ind.parent_column:  # rule 1
+                continue
+            if pk_of.get(ind.child_table) == ind.child_column:    # rule 2
+                continue
+            child_raw = dfs[ind.child_table][ind.child_column]
+            parent_raw = dfs[ind.parent_table][ind.parent_column]
+            if discovery.value_kind(child_raw) != discovery.value_kind(parent_raw):
+                continue                                        # rule 3
+            parent_distinct = int(parent_raw.nunique(dropna=True))
+            if parent_distinct == 0:
+                continue
+            coverage = int(child_raw.nunique(dropna=True)) / parent_distinct
+            name_match = _id_base(ind.child_column) in _table_name_forms(
+                ind.parent_table
+            )
+            scored.append((coverage, name_match, ind))
+
+        # Best parent per child column: coverage, then the name, then a stable
+        # alphabetical order so the result does not depend on dict ordering.
+        best: Dict[Tuple[str, str], Tuple[float, bool, Any]] = {}
+        for coverage, name_match, ind in scored:
+            key = (ind.child_table, ind.child_column)
+            current = best.get(key)
+            candidate = (coverage, name_match, ind)
+            if current is None or (
+                (coverage, name_match, ind.parent_table)
+                > (current[0], current[1], current[2].parent_table)
+            ):
+                best[key] = candidate
+
+        rels: Dict[str, List[RelationshipSpec]] = {t: [] for t in table_specs}
+        edges: set = set()
+        for coverage, name_match, ind in sorted(
+            best.values(), key=lambda x: (-x[0], x[2].child_table, x[2].child_column)
+        ):
+            if _would_cycle(edges, ind.child_table, ind.parent_table):
+                continue
+            edges.add((ind.child_table, ind.parent_table))
+            rels[ind.child_table].append(RelationshipSpec(**{
+                "from": ind.child_column,
+                "to": f"{ind.parent_table}.{ind.parent_column}",
+                "alias": ind.parent_table,
+                "provenance": InferenceProvenance(
+                    algorithm="SPIDER" if not name_match else "SPIDER+name-tiebreak",
+                    citation=discovery.CITATIONS["SPIDER"],
+                    measure="exact" if ind.error == 0.0 else "ind_error",
+                    confidence=round(1.0 - ind.error, 6),
+                    error=round(ind.error, 6),
+                    support=ind.support,
+                    validated_on="full",
+                    fingerprint=_fingerprint(
+                        [ind.child_column,
+                         f"{ind.parent_table}.{ind.parent_column}"]
+                    ),
+                ),
+            }))
+        return rels
+
+    @classmethod
+    def _relationships_from_names(
         cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
     ) -> Dict[str, List[RelationshipSpec]]:
+        """The pre-discovery rule: ``<parent>_id`` plus a table-stem match.
+
+        Kept as the fallback for installations without the optional discovery
+        extra. Its recall is bounded by a naming convention -- on the CFPB
+        source no column is named ``<table>_id``, so it finds nothing at all --
+        which is the whole reason SPIDER is now the primary path.
+        """
         rels: Dict[str, List[RelationshipSpec]] = {t: [] for t in table_specs}
         names = set(table_specs)
         for cname, cts in table_specs.items():
@@ -748,68 +1271,22 @@ class DatasetProfiler:
                     if cls._value_kind(parent) != child_kind:
                         continue
                     if child_vals.issubset(cls._key_values(parent)):
-                        rels[cname].append(RelationshipSpec(
-                            **{"from": colname, "to": f"{pname}.{pkp}", "alias": pname}
-                        ))
+                        rels[cname].append(RelationshipSpec(**{
+                            "from": colname,
+                            "to": f"{pname}.{pkp}",
+                            "alias": pname,
+                            "provenance": InferenceProvenance(
+                                algorithm="name-heuristic",
+                                measure="name-match",
+                                support=int(len(cdf)),
+                                validated_on="full",
+                                fingerprint=_fingerprint(
+                                    [colname, f"{pname}.{pkp}"]
+                                ),
+                            ),
+                        }))
                         break
         return rels
-
-    # |r| above which two numeric columns are reported as related.
-    _DEPENDS_ON_R = 0.95
-
-    @classmethod
-    def _infer_depends_on(
-        cls, table_specs: Dict[str, "TableSpec"], dfs: Dict[str, pd.DataFrame]
-    ) -> None:
-        """Record strongly correlated numeric column pairs as a hint.
-
-        This was a double loop running ``df[[a, b]].dropna().corr()`` once per
-        pair: O(C^2) pandas round-trips, each slicing a two-column frame,
-        copying it, dropping rows and building a 2x2 result, to read a single
-        number off it -- for a quantity the whole correlation matrix produces
-        in one call. 40 numeric columns meant 780 of those.
-
-        ``DataFrame.corr`` uses pairwise-complete observations, which is
-        exactly what the per-pair ``dropna()`` was doing, so the values are
-        unchanged; ``tests/test_profiler_depends_on.py`` asserts equivalence
-        against a reference implementation of the old loop.
-
-        NOTE: the output of this method -- ``metadata.suggested_depends_on``
-        -- is read by nothing in this package. Not the generation engine, not
-        ``infer.resolve_generator``, not the conformance checker, not the CLI.
-        It is computed, written into the spec, serialized, and never consulted.
-        It is kept here rather than deleted because whether it should become a
-        real feature (feeding ``ColumnSpec.depends_on``) or be dropped is a
-        product decision, not a correctness fix.
-        """
-        for t, cts in table_specs.items():
-            df = dfs[t]
-            num_cols = [c.name for c in cts.columns
-                        if c.dtype in ("int", "float") and c.name in df.columns]
-            if len(num_cols) < 2:
-                continue
-
-            matrix = df[num_cols].corr(numeric_only=True)
-            cols = list(matrix.columns)
-            if len(cols) < 2:
-                continue
-            # A constant column correlates with nothing and yields NaN; treat
-            # that as "no relationship" rather than letting it propagate.
-            values = np.nan_to_num(np.abs(matrix.to_numpy()), nan=0.0)
-
-            rows, cols_idx = np.triu_indices(len(cols), k=1)
-            strong = values[rows, cols_idx] > cls._DEPENDS_ON_R
-
-            sugg: Dict[str, List[str]] = {}
-            for i, j in zip(rows[strong], cols_idx[strong]):
-                a, b = cols[int(i)], cols[int(j)]
-                sugg.setdefault(a, []).append(b)
-                sugg.setdefault(b, []).append(a)
-
-            if sugg:
-                md = dict(cts.metadata or {})
-                md["suggested_depends_on"] = sugg
-                cts.metadata = md
 
     # ----- internals -----
     @staticmethod
@@ -855,7 +1332,7 @@ class DatasetProfiler:
         n_nulls = int(stats_src.isna().sum())
         null_rate = round(n_nulls / total, 4) if total else 1.0
 
-        dtype, profile = self._infer_type_and_profile(s, full=full)
+        dtype, profile = self._infer_type_and_profile(s, full=full, column=name)
         params: dict = {}
         constraints: dict = {"nullable": n_nulls > 0, "null_rate": null_rate}
 
@@ -932,6 +1409,7 @@ class DatasetProfiler:
 
     def _infer_type_and_profile(
         self, s: pd.Series, full: Optional[pd.Series] = None,
+        column: Optional[str] = None,
     ) -> Tuple[str, Optional[ColumnProfile]]:
         if pd.api.types.is_bool_dtype(s.dtype):
             return "bool", None
@@ -968,7 +1446,8 @@ class DatasetProfiler:
             full_vals = (full.dropna().astype(str)
                          if full is not None else None)
             return "str", ColumnProfile(
-                categorical=self._categorical_profile(vals, full_vals)
+                categorical=self._categorical_profile(vals, full_vals,
+                                                      column=column)
             )
 
         # free text: length stats (+ pattern if short)
@@ -980,6 +1459,7 @@ class DatasetProfiler:
 
     def _categorical_profile(
         self, vals: pd.Series, full_vals: Optional[pd.Series] = None,
+        column: Optional[str] = None,
     ) -> CategoricalProfile:
         """Build the categorical profile for a column, applying disclosure controls.
 
@@ -1033,8 +1513,16 @@ class DatasetProfiler:
 
         redacted = False
         if self.redact_categoricals:
+            real_labels = list(values)
             values = _redact_categorical_values(values)
             redacted = True
+            # The label -> placeholder mapping, kept in memory only, so that a
+            # conditional table built later can be expressed in the SAME
+            # placeholder vocabulary instead of reintroducing the real labels
+            # this flag exists to remove. It is never written anywhere.
+            if column is not None:
+                self._redaction_maps[column] = dict(
+                    zip(real_labels, values.keys()))
 
         return CategoricalProfile(
             values=values, null_rate=0.0, redacted=redacted,
@@ -1149,24 +1637,380 @@ class DatasetProfiler:
         except Exception:
             return False
 
-    def _detect_pk(self, cols: List[ColumnSpec]) -> Optional[str]:
-        # A primary key is UNIQUE *and* NOT NULL. Only the first half was
-        # being checked, so a unique-but-nullable column could be nominated
-        # and would then fail the conformance checker's own PK check, because
-        # pandas' ``duplicated`` counts repeated NaNs as duplicates where SQL
-        # UNIQUE does not.
-        candidates = [
-            c for c in cols
-            if c.constraints.get("unique")
-            and not c.constraints.get("nullable", True)
-        ]
-        if not candidates:
+    def _discover_uccs(self, df: pd.DataFrame) -> Optional[List[Any]]:
+        """Unique column combinations of the source table, or None.
+
+        HyUCC (Papenbrock & Naumann, BTW 2017), via ``syntab.discovery``.
+        Returns None -- not an empty list -- when discovery is switched off or
+        unavailable, so the caller can tell "no keys" from "did not look".
+        """
+        if not self.discover:
             return None
-        for c in candidates:
-            if _is_id_like(c.name):
-                return c.name
-        # otherwise first unique integer/string column
-        for c in candidates:
-            if c.dtype in ("int", "str"):
-                return c.name
-        return candidates[0].name
+        try:
+            return discovery.discover_unique_column_combinations(
+                df,
+                max_columns=MAX_KEY_COLUMNS,
+                sample_rows=self.discovery_sample_rows,
+                seed=self.seed,
+            )
+        except discovery.DiscoveryUnavailable:
+            return None
+
+    def _discover_fds(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Functional dependencies of the source table, with provenance.
+
+        HyFD for the exact ones and Pyro for the approximate ones, filtered by
+        mu\' -- see ``syntab.discovery``, which cites all three. Recorded under
+        ``metadata.discovery`` because ``metadata`` is the free-form provenance
+        dict a TableSpec already has; no new schema field is introduced for a
+        result that does not yet steer generation.
+
+        THIS REPLACES ``metadata.suggested_depends_on``, which held pairs of
+        Pearson-correlated numeric columns. Correlation is not dependency: it
+        is symmetric where a dependency has a direction, it is defined only
+        between numeric columns so it could never see ZIP code -> State, and
+        a coefficient above 0.95 is not evidence that one column determines
+        another. That field is gone; this is what a real answer looks like.
+        """
+        if not self.discover_fds:
+            return []
+        try:
+            found = discovery.discover_functional_dependencies(
+                df,
+                error=self.fd_error,
+                min_mu=self.fd_min_mu,
+                max_lhs=self.discovery_max_lhs,
+                sample_rows=self.discovery_sample_rows,
+                seed=self.seed,
+            )
+        except discovery.DiscoveryUnavailable:
+            return []
+        # Strongest first, so a truncated list is the useful part of the list.
+        found.sort(key=lambda f: (-(f.mu_prime or 1.0), len(f.determinant),
+                                  f.determinant, f.dependent))
+        return [f.as_dict() for f in found[:MAX_RECORDED_FDS]]
+
+    # ----- conditional generation -------------------------------------------
+
+    def _conditional_candidates(self, df: pd.DataFrame) -> List[Any]:
+        """Discover the dependencies that conditioning may draw on.
+
+        A SECOND, NARROWER PASS rather than a reuse of ``_discover_fds``.
+        Reporting an FD and conditioning on one answer different questions and
+        take different thresholds -- see
+        ``discovery.DEFAULT_CONDITIONAL_FD_ERROR`` -- and running the two
+        separately means turning conditioning on cannot change a single line of
+        what ``metadata.discovery.functional_dependencies`` reports. The
+        report stays a report. It costs one extra Pyro run, bounded to
+        single-column determinants: about 5 s on the 208k-row CFPB source
+        against the 21 s the rest of profiling takes.
+        """
+        if not self.condition_on_fds:
+            return []
+        try:
+            return discovery.discover_functional_dependencies(
+                df,
+                error=max(self.fd_error, self.conditional_fd_error),
+                min_mu=self.fd_min_mu,
+                max_lhs=MAX_CONDITIONAL_LHS,
+                sample_rows=self.discovery_sample_rows,
+                seed=self.seed,
+            )
+        except discovery.DiscoveryUnavailable:
+            return []
+
+    def _conditionally_generable(self, col: ColumnSpec, pk: Any) -> bool:
+        """Whether a column may sit on either end of a conditional edge.
+
+        Categorical, because a conditional table over a continuous or free-text
+        column is a table of the data itself. Not PII, because the whole point
+        of flagging PII is that no real value or real structure of it reaches
+        the spec. Not a key, because a key is generated to be unique and
+        conditioning it on anything would fight that.
+        """
+        if col.pii:
+            return False
+        if col.constraints.get("unique"):
+            return False
+        keys = [pk] if isinstance(pk, str) else list(pk or [])
+        if col.name in keys:
+            return False
+        prof = col.profile
+        return bool(prof and prof.categorical and prof.categorical.values)
+
+    def _apply_conditional_generation(
+        self, df: pd.DataFrame, cols: List[ColumnSpec], pk: Any,
+    ) -> List[Dict[str, Any]]:
+        """Turn selected dependencies into ``conditional`` generators, in place.
+
+        This is the step that closes the loop. Until now the profiler
+        discovered that Sub-product determines Product and wrote it into a
+        metadata dict that nothing read; generation then sampled the two
+        columns independently and produced a Product/Sub-product pair scoring
+        0.16 against real data whose marginals scored 0.98 and 0.96.
+
+        Returns the edges it applied, for ``metadata.discovery``.
+        """
+        candidates = self._conditional_candidates(df)
+        if not candidates:
+            return []
+
+        by_name = {c.name: c for c in cols}
+        eligible = [c.name for c in cols
+                    if self._conditionally_generable(c, pk)]
+        edges = discovery.choose_dependency_forest(candidates, eligible)
+
+        applied: List[Dict[str, Any]] = []
+        for edge in edges:
+            dependent = by_name.get(edge.dependent)
+            determinant = by_name.get(edge.determinant)
+            if dependent is None or determinant is None:
+                continue
+            params = self._conditional_params(df, determinant, dependent)
+            if params is None:
+                continue
+            dependent.generator = "conditional"
+            dependent.params = params
+            if edge.determinant not in dependent.depends_on:
+                dependent.depends_on = list(dependent.depends_on) + [
+                    edge.determinant]
+            applied.append(edge.as_dict())
+        return applied
+
+    def _conditional_params(
+        self, df: pd.DataFrame, determinant: ColumnSpec, dependent: ColumnSpec,
+    ) -> Optional[Dict[str, Any]]:
+        """Empirical P(dependent | determinant), in the vocabulary of the spec.
+
+        Three alignments have to hold or the conditional is either wrong or
+        larger than it needs to be:
+
+        VOCABULARY. Both sides are expressed in the labels the spec already
+        declares in ``profile.categorical.values``, and nothing else. That is
+        not a detail. Those labels come from the profiling SAMPLE while this
+        table is built from the FULL frame, so without the restriction a
+        conditional would carry keys the determinant's own generator can never
+        produce -- 30 of 161 dead keys on the CFPB Issue column -- and emit
+        dependent values the column's declared vocabulary does not list. The
+        first is waste; the second is worse, because it makes
+        ``profile.categorical.values`` an inaccurate statement of what real
+        labels the file contains, and that field is what a disclosure review
+        reads. A spec should say what it does.
+
+        NULLS. A null determinant is a key like any other -- 18.8% of CFPB
+        Sub-product is null and those rows still have a Product. A null
+        DEPENDENT is carried as a value inside the conditional distribution,
+        which is why ``engine`` does not also inject nulls at the column's
+        marginal ``null_rate`` for a conditional column: P(NULL | X) varies
+        enormously by X (some CFPB Issues have no sub-issue at all) and one
+        marginal rate applied uniformly would put the missingness in the wrong
+        rows and take the pair-trend score down with it.
+
+        REDACTION. Under --redact-categoricals the declared vocabulary is the
+        placeholder set, so the same restriction is what keeps real labels out
+        of the conditional table.
+
+        CELL COUNTS. --min-cell-count is applied per determinant group, using
+        the conditional cell count. This is stricter than applying it to the
+        marginals, and deliberately so: a conditional cell is a smaller group
+        than a marginal cell by construction, so the suppression matters more
+        here, not less. Where suppression has already put an ``__other__``
+        bucket in a column's vocabulary, out-of-vocabulary values join it
+        rather than being dropped -- that is what the bucket is for.
+
+        DISCLOSURE NOTE
+        ---------------
+        A conditional table embeds strictly more of the source than the two
+        marginals it replaces: which combinations co-occur, and in what
+        proportion. See ``docs/disclosure.md``.
+        """
+        from .generators import conditional_params
+
+        det_map = self._label_map(determinant)
+        dep_map = self._label_map(dependent)
+        if det_map is None or dep_map is None:
+            return None
+
+        det_raw, dep_raw = df[determinant.name], df[dependent.name]
+        det_labels = self._as_spec_labels(det_raw, det_map)
+        dep_labels = self._as_spec_labels(dep_raw, dep_map)
+
+        # A value with no label in the declared vocabulary can never be
+        # generated (determinant) or must never be generated (dependent), so
+        # its rows say nothing about what generation will do.
+        keep = (det_raw.isna() | det_labels.notna()) & (
+            dep_raw.isna() | dep_labels.notna())
+        if not bool(keep.any()):
+            return None
+
+        frame = pd.DataFrame({
+            determinant.name: det_labels[keep],
+            dependent.name: dep_labels[keep],
+        })
+        return conditional_params(
+            frame, [determinant.name], dependent.name,
+            min_cell_count=self.min_cell_count,
+            other_label=OTHER_BUCKET_LABEL,
+        )
+
+    def _label_map(self, col: ColumnSpec) -> Optional[Dict[str, str]]:
+        """Real ``str(value)`` label -> the label this spec declares for it.
+
+        None when the column declares no categorical vocabulary, which
+        disqualifies it from taking part in a conditional at all. Identity
+        over the declared labels normally; the placeholder vocabulary under
+        --redact-categoricals.
+        """
+        prof = col.profile.categorical if col.profile else None
+        if prof is None or not prof.values:
+            return None
+        if self.redact_categoricals:
+            mapping = self._redaction_maps.get(col.name)
+            return dict(mapping) if mapping else None
+        return {label: label for label in prof.values}
+
+    @staticmethod
+    def _as_spec_labels(raw: pd.Series, mapping: Dict[str, str]) -> pd.Series:
+        """Values as the labels this spec declares, with nulls kept as None.
+
+        A value outside the vocabulary joins the ``__other__`` bucket when
+        suppression has created one, and is otherwise dropped by the caller.
+        """
+        labels = raw.astype(str).map(mapping)
+        other = mapping.get(OTHER_BUCKET_LABEL)
+        if other is not None:
+            labels = labels.where(labels.notna() | raw.isna(), other)
+        return labels.astype(object).where(raw.notna() & labels.notna(), None)
+
+    def _composite_unique_constraints(
+        self, uccs: Optional[List[Any]], pk: Optional[Any]
+    ) -> List[List[str]]:
+        """Composite candidate keys, as spec-level unique constraints.
+
+        Only genuinely composite ones (2+ columns) and only a few: see
+        MAX_COMPOSITE_UNIQUE_CONSTRAINTS for why the cap exists. Single-column
+        uniqueness is already carried by ``constraints.unique`` on the column,
+        which is where the engine and the conformance checker read it from.
+        """
+        if not uccs:
+            return []
+        pk_cols = tuple(pk) if isinstance(pk, list) else (pk,) if pk else ()
+        out: List[List[str]] = []
+        for u in uccs:
+            if len(u.columns) < 2 or u.columns == pk_cols:
+                continue
+            out.append(list(u.columns))
+            if len(out) >= MAX_COMPOSITE_UNIQUE_CONSTRAINTS:
+                break
+        return out
+
+    def _detect_pk(
+        self,
+        cols: List[ColumnSpec],
+        uccs: Optional[List[Any]] = None,
+        source_rows: Optional[int] = None,
+    ) -> Tuple[Optional[Any], Optional[InferenceProvenance]]:
+        """Choose a primary key from discovered unique column combinations.
+
+        A primary key is UNIQUE *and* NOT NULL. Both halves are checked: a
+        unique-but-nullable column nominated as a key fails the conformance
+        checker's own PK check, because pandas' ``duplicated`` counts repeated
+        NaNs as duplicates where SQL UNIQUE does not.
+
+        The uniqueness evidence is HyUCC's, over the whole table, not a naming
+        convention. THE COLUMN NAME IS A TIE-BREAKER AND NOTHING ELSE: it is
+        consulted only when more than one discovered candidate key survives
+        the NOT NULL filter, which is the one situation where the data cannot
+        distinguish them -- ``paid`` and ``record_id`` are both unique in
+        ``{paid, record_id, region}`` and only the name says which is the key.
+        When a single candidate survives, the name is never read, and the
+        recorded provenance says which of the two decided.
+
+        Composite keys: adopted only when no single-column candidate exists.
+        A one-column key is what downstream generation is built around, and a
+        table that has both is a table whose single-column key is the key.
+        Among several composites the narrowest wins, ties broken
+        lexicographically -- an arbitrary rule, chosen for determinism, and
+        the reason the losers are still recorded as unique constraints.
+
+        Falls back to the pre-existing per-column uniqueness check when
+        discovery is unavailable, recording ``algorithm="name-heuristic"`` so
+        the spec does not overstate its evidence.
+        """
+        by_name = {c.name: c for c in cols}
+
+        def usable(name: str) -> bool:
+            c = by_name.get(name)
+            return bool(c and not c.constraints.get("nullable", True))
+
+        discovered = uccs is not None
+        if discovered:
+            singles = [u for u in uccs
+                       if len(u.columns) == 1 and usable(u.columns[0])]
+            composites = [u for u in uccs
+                          if 2 <= len(u.columns) <= MAX_KEY_COLUMNS
+                          and all(usable(c) for c in u.columns)]
+        else:
+            # Pre-discovery behaviour: each column judged on its own.
+            singles = [
+                _NamedKey((c.name,)) for c in cols
+                if c.constraints.get("unique")
+                and not c.constraints.get("nullable", True)
+            ]
+            composites = []
+
+        algorithm = "HyUCC" if discovered else "name-heuristic"
+        support = source_rows
+
+        if not singles:
+            if composites:
+                chosen = min(composites, key=lambda u: (len(u.columns), u.columns))
+                return list(chosen.columns), InferenceProvenance(
+                    algorithm=algorithm,
+                    citation=discovery.CITATIONS.get(algorithm),
+                    measure="exact", confidence=1.0, support=support,
+                    validated_on="full",
+                    fingerprint=_fingerprint(list(chosen.columns)),
+                )
+            return None, None
+
+        # Ordered by the columns declaration order, not by the order the
+        # discovery algorithm happened to emit its results in, so that the
+        # last-resort "first candidate wins" tie-break is deterministic and
+        # means what it says.
+        position = {c.name: i for i, c in enumerate(cols)}
+        names = sorted((u.columns[0] for u in singles),
+                       key=lambda n: position.get(n, len(position)))
+        if len(names) == 1:
+            chosen, tie_broken_by = names[0], None
+        else:
+            chosen, tie_broken_by = self._break_key_tie(names, by_name)
+
+        return chosen, InferenceProvenance(
+            algorithm=algorithm if tie_broken_by is None
+            else f"{algorithm}+{tie_broken_by}-tiebreak",
+            citation=discovery.CITATIONS.get(algorithm),
+            measure="exact", confidence=1.0, support=support,
+            validated_on="full",
+            fingerprint=_fingerprint(chosen),
+        )
+
+    @staticmethod
+    def _break_key_tie(
+        names: List[str], by_name: Dict[str, ColumnSpec]
+    ) -> Tuple[str, str]:
+        """Pick between several equally-unique candidate keys.
+
+        Ordered weakest-evidence-last: an identifier-shaped name first, then a
+        key-shaped dtype, then declaration order. All three are conventions
+        rather than facts about the data -- which is precisely why they run
+        only after the data has failed to decide.
+        """
+        for n in names:
+            if _is_id_like(n):
+                return n, "name"
+        for n in names:
+            c = by_name.get(n)
+            if c is not None and c.dtype in ("int", "str"):
+                return n, "dtype"
+        return names[0], "order"

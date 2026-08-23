@@ -24,7 +24,7 @@ import pandas as pd
 from faker import Faker
 
 from .generators import GenContext, build_generator, _parse_dt
-from .infer import resolve_generator
+from .infer import conditional_determinants, resolve_generator
 from . import formats
 from .rules import Rule, compile_rules
 from .spec import ColumnSpec, Spec, SpecError, TableSpec, expand_many_to_many
@@ -155,7 +155,10 @@ def _topo_columns(table: TableSpec, fk_cols: set) -> List[ColumnSpec]:
     by_name = {c.name: c for c in cols}
     deps: Dict[str, set] = {c.name: set() for c in cols}
     for c in cols:
-        for d in c.depends_on:
+        # params.on of a conditional generator is a generation dependency in
+        # the same sense depends_on is: the determinant must exist in the row
+        # before the dependent can be drawn conditioned on it.
+        for d in list(c.depends_on) + conditional_determinants(c):
             if d in by_name and d != c.name:
                 deps[c.name].add(d)
     indeg = {n: len(v) for n, v in deps.items()}
@@ -697,6 +700,17 @@ class GenerationEngine:
                 for d in c.depends_on:
                     if d not in col_index[t.name]:
                         raise SpecError(f"depends_on '{d}' unknown in {t.name}.{c.name}")
+                for d in conditional_determinants(c):
+                    if d not in col_index[t.name]:
+                        raise SpecError(
+                            f"conditional generator determinant '{d}' unknown "
+                            f"in {t.name}.{c.name} (params.on)"
+                        )
+                    if d == c.name:
+                        raise SpecError(
+                            f"conditional generator in {t.name}.{c.name} is "
+                            f"conditioned on itself (params.on)"
+                        )
                 for branch in c.when:
                     try:
                         condition = Rule(branch.condition)
@@ -1030,7 +1044,17 @@ class GenerationEngine:
 
                 nullable = col.constraints.get("nullable", True)
                 null_rate = float(col.constraints.get("null_rate", 0.0))
-                if col.dtype != "fk" and nullable and null_rate > 0 and rng.random() < null_rate:
+                # A conditional generator carries NULL as a value inside each
+                # per-key distribution, so it owns its own missingness.
+                # Injecting nulls on top at the column's marginal rate would
+                # double-count them, and would put them in the wrong rows:
+                # P(NULL | X) varies enormously by X -- some CFPB Issues have
+                # no sub-issue at all -- and one marginal rate applied
+                # uniformly is exactly the independence assumption this
+                # generator exists to remove.
+                if (col.dtype != "fk" and nullable and null_rate > 0
+                        and gen_name != "conditional"
+                        and rng.random() < null_rate):
                     row[col.name] = None
                     continue
 
