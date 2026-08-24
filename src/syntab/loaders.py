@@ -8,7 +8,33 @@ from typing import Any, Dict, Union
 
 import yaml
 
-from .spec import Spec
+from .spec import CURRENT_SPEC_VERSION, SUPPORTED_SPEC_VERSIONS, Spec, SpecVersionError
+
+
+def migrate_spec_dict(data: dict, *, target_version: str = CURRENT_SPEC_VERSION) -> dict:
+    """Normalize a legacy document to the current Spec wire format.
+
+    Version ``1`` and ``1.0.0`` were emitted by early callers and are
+    losslessly equivalent to the current ``1.0`` format.  A missing version is
+    treated as that same legacy format for backward compatibility.  Unknown
+    versions fail explicitly instead of being silently interpreted as the
+    current schema.
+    """
+    if not isinstance(data, dict):
+        raise SpecVersionError("Spec document must be a mapping")
+    if target_version not in SUPPORTED_SPEC_VERSIONS:
+        raise SpecVersionError(f"unsupported target Spec version: {target_version}")
+    normalized = dict(data)
+    version = normalized.get("spec_version")
+    if version in (None, "1", "1.0.0"):
+        normalized["spec_version"] = target_version
+        return normalized
+    if version not in SUPPORTED_SPEC_VERSIONS:
+        raise SpecVersionError(
+            f"unsupported spec_version {version!r}; supported versions: "
+            f"{', '.join(sorted(SUPPORTED_SPEC_VERSIONS))}"
+        )
+    return normalized
 
 
 def from_file(path: Union[str, Path]) -> Spec:
@@ -28,11 +54,11 @@ def from_file(path: Union[str, Path]) -> Spec:
             data = yaml.safe_load(text)
         except Exception:
             data = json.loads(text)
-    return Spec.model_validate(data)
+    return Spec.model_validate(migrate_spec_dict(data))
 
 
 def from_dict(data: dict) -> Spec:
-    return Spec.model_validate(data)
+    return Spec.model_validate(migrate_spec_dict(data))
 
 
 def spec_to_dict(spec: Spec) -> Dict[str, Any]:
@@ -79,6 +105,6 @@ def to_file(spec: Spec, path: Union[str, Path], fmt: str | None = None) -> None:
     if fmt in ("yaml", "yml"):
         p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     elif fmt == "json":
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     else:
         raise ValueError(f"Unsupported format: {fmt}")

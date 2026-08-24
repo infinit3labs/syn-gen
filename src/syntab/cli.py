@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict
 
@@ -30,6 +31,33 @@ from .discovery import (
     DEFAULT_MIN_MU,
 )
 from .spec import Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings
+
+try:
+    _TOOL_VERSION = version("syntab")
+except PackageNotFoundError:  # pragma: no cover - source checkout fallback
+    _TOOL_VERSION = "0.0.0+local"
+
+
+def _report_payload(report: dict, *, inputs: Dict[str, str], spec: Spec | None = None,
+                    thresholds: Dict[str, object] | None = None) -> dict:
+    """Add stable provenance needed by CI consumers to a report."""
+    report["tool_version"] = _TOOL_VERSION
+    report["inputs"] = dict(inputs)
+    report["spec"] = (
+        {"name": spec.metadata.name, "version": spec.spec_version,
+         "seed": spec.settings.seed}
+        if spec is not None else None
+    )
+    report["thresholds"] = dict(thresholds or {})
+    return report
+
+
+def _write_report(path: str, report: dict, *, inputs: Dict[str, str],
+                  spec: Spec | None = None,
+                  thresholds: Dict[str, object] | None = None) -> None:
+    payload = _report_payload(report, inputs=inputs, spec=spec, thresholds=thresholds)
+    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True, default=str),
+                          encoding="utf-8")
 
 
 @click.group()
@@ -136,7 +164,9 @@ def init() -> None:
 
 @cli.command()
 @click.option("--spec", "spec_path", required=True, help="Path to Spec YAML/JSON.")
-def validate(spec_path: str) -> None:
+@click.option("--migrate-out", default=None, type=click.Path(),
+              help="Write the normalized current-version Spec to this path.")
+def validate(spec_path: str, migrate_out: str | None) -> None:
     """Validate a Spec (structure + references + rule syntax)."""
     try:
         spec = from_file(spec_path)
@@ -144,7 +174,11 @@ def validate(spec_path: str) -> None:
     except Exception as e:
         click.echo(f"Invalid: {e}", err=True)
         sys.exit(1)
-    click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables)")
+    if migrate_out:
+        to_file(spec, migrate_out)
+        click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables); migrated to {migrate_out}")
+    else:
+        click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables; spec_version={spec.spec_version})")
 
 
 @cli.command()
@@ -201,6 +235,9 @@ def validate(spec_path: str) -> None:
               "report contains more conditional cells than this.")
 @click.option("--pii", "pii", default=None,
               help="Comma-separated column names to treat as PII.")
+@click.option("--pii-ignore", "pii_ignore", default=None,
+              help="Comma-separated columns to exclude from automatic PII detection. "
+                   "An explicit --pii selection still wins.")
 @click.option("--pii-strategy", "pii_strategy", default="faker",
               type=click.Choice(["faker", "mask", "redact", "hash"]),
               help="Anonymization strategy for --pii columns.")
@@ -263,17 +300,23 @@ def validate(spec_path: str) -> None:
                    "Rules a human has edited since the spec was written are "
                    "kept, detected by comparing each rule against a "
                    "fingerprint of what the profiler last wrote. Without this "
-                   "a re-profile overwrites the file and every hand "
-                   "correction with it.")
+              "a re-profile overwrites the file and every hand "
+              "correction with it.")
+@click.option("--disclosure-out", default=None, type=click.Path(),
+              help="Write the machine-readable disclosure report to this path.")
+@click.option("--disclosure-mode", type=click.Choice(["error", "warning"]),
+              default="error", show_default=True,
+              help="Whether disclosure-budget violations stop profile output or "
+                   "are emitted as warnings.")
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
             max_categorical: int, max_categorical_ratio: float,
             min_cell_count: int, redact_categoricals: bool,
             max_unredacted_values: int, max_rare_values: int,
             max_conditional_cells: int,
-            pii: str, pii_strategy: str, discover, discover_fds: bool,
+            pii: str, pii_ignore: str, pii_strategy: str, discover, discover_fds: bool,
             condition_on_fds: bool, conditional_fd_error: float,
             fd_error: float, fd_min_mu: float, ind_error: float,
-            merge_into: str) -> None:
+            merge_into: str, disclosure_out: str, disclosure_mode: str) -> None:
     """Profile one or more datasets into a Spec.
 
     With a single dataset, produces a single-table Spec. With multiple
@@ -288,11 +331,13 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     from .profiler import DatasetProfiler
 
     pii_cols = [c.strip() for c in (pii or "").split(",") if c.strip()] or None
+    pii_ignored = [c.strip() for c in (pii_ignore or "").split(",") if c.strip()] or None
     # profiler options threaded through every construction path below
     opts = dict(max_categorical=max_categorical,
                 max_categorical_ratio=max_categorical_ratio,
                 redact_categoricals=redact_categoricals,
                 min_cell_count=min_cell_count,
+                pii_exclude_columns=pii_ignored,
                 discover=discover, discover_fds=discover_fds,
                 condition_on_fds=condition_on_fds,
                 conditional_fd_error=conditional_fd_error,
@@ -324,7 +369,11 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         max_rare_values=max_rare_values,
         max_conditional_cells=max_conditional_cells,
     ))
-    if violations:
+    if disclosure_out:
+        Path(disclosure_out).write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+    if violations and disclosure_mode == "error":
         details = "; ".join(
             f"{v.metric}={v.actual} exceeds budget {v.limit}"
             for v in violations
@@ -332,6 +381,8 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         raise click.ClickException(
             f"disclosure budget exceeded; no spec written: {details}"
         )
+    if violations:
+        click.echo(f"Warning: disclosure budget exceeded: {details}", err=True)
     to_file(spec, out)
     n_rel = sum(len(t.relationships) for t in spec.tables)
     n_pii = sum(1 for t in spec.tables for c in t.columns if c.pii)
@@ -435,7 +486,10 @@ def _read_tables(path: str) -> Dict[str, pd.DataFrame]:
 @click.option("--synthetic", "synth_path", required=True, help="Path to the synthetic dataset.")
 @click.option("--spec", "spec_path", default=None, help="Optional Spec for column types.")
 @click.option("--out", "out", default=None, help="Write the JSON report to this path.")
-def compare(real_path: str, synth_path: str, spec_path: str, out: str) -> None:
+@click.option("--compact", is_flag=True,
+              help="Write only the stable machine-readable summary to --out.")
+def compare(real_path: str, synth_path: str, spec_path: str, out: str,
+            compact: bool) -> None:
     """Compare real vs synthetic per-column distributions (pass/warn/fail).
 
     MARGINALS ONLY. This compares each column against its counterpart in
@@ -451,7 +505,8 @@ def compare(real_path: str, synth_path: str, spec_path: str, out: str) -> None:
     report = validate(real, synth, spec)
     click.echo(report.to_text())
     if out:
-        Path(out).write_text(json.dumps(report.to_dict(), indent=2, default=str), encoding="utf-8")
+        _write_report(out, report.to_dict(compact=compact),
+                      inputs={"real": real_path, "synthetic": synth_path}, spec=spec)
         click.echo(f"Report written to {out}")
     sys.exit(0 if report.overall_pass else 1)
 
@@ -463,6 +518,8 @@ def compare(real_path: str, synth_path: str, spec_path: str, out: str) -> None:
               help="Optional Spec. Used for column types and key columns, "
                    "which are more reliable than inferring them from the data.")
 @click.option("--out", "out", default=None, help="Write the JSON report to this path.")
+@click.option("--compact", is_flag=True,
+              help="Write only the stable machine-readable summary to --out.")
 @click.option("--verbose", is_flag=True, help="Show the per-column breakdown.")
 @click.option("--min-score", "min_score", default=None, type=float,
               help="Exit non-zero if the overall score falls below this. For "
@@ -478,7 +535,7 @@ def compare(real_path: str, synth_path: str, spec_path: str, out: str) -> None:
                    "columns, which is the failure mode a rule-based generator "
                    "is most exposed to.")
 def quality_cmd(real_path: str, synth_path: str, spec_path: str, out: str,
-                verbose: bool, min_score: float, sample: int,
+                compact: bool, verbose: bool, min_score: float, sample: int,
                 no_pair_trends: bool) -> None:
     """Score synthetic fidelity against real data (graded, 0..1).
 
@@ -504,8 +561,11 @@ def quality_cmd(real_path: str, synth_path: str, spec_path: str, out: str,
     )
     click.echo(report.to_text(verbose=verbose))
     if out:
-        Path(out).write_text(json.dumps(report.to_dict(), indent=2, default=str),
-                             encoding="utf-8")
+        _write_report(
+            out, report.to_dict(compact=compact),
+            inputs={"real": real_path, "synthetic": synth_path}, spec=spec,
+            thresholds={"min_score": min_score} if min_score is not None else {},
+        )
         click.echo(f"Report written to {out}")
     if min_score is not None and report.overall_score < min_score:
         click.echo(f"Overall score {report.overall_score:.4f} is below "
@@ -520,13 +580,15 @@ def quality_cmd(real_path: str, synth_path: str, spec_path: str, out: str,
               help="Optional Spec. Supplies column types and the key columns "
                    "checked for uniqueness.")
 @click.option("--out", "out", default=None, help="Write the JSON report to this path.")
+@click.option("--compact", is_flag=True,
+              help="Write only the stable machine-readable summary to --out.")
 @click.option("--verbose", is_flag=True, help="Show every check, not just failures.")
 @click.option("--tolerance", default=0.0, type=float, show_default=True,
               help="How far below 1.0 a diagnostic metric may fall and still "
                    "pass. The default is strict on purpose: these checks are "
                    "for things that are broken, not things that are imprecise.")
 def diagnose(real_path: str, synth_path: str, spec_path: str, out: str,
-             verbose: bool, tolerance: float) -> None:
+             compact: bool, verbose: bool, tolerance: float) -> None:
     """Check that synthetic data is structurally valid (pass/fail).
 
     Data Structure (do the columns match?) and Data Validity (is every value
@@ -540,8 +602,11 @@ def diagnose(real_path: str, synth_path: str, spec_path: str, out: str,
     report = quality.diagnostic_report(real, synth, spec=spec, tolerance=tolerance)
     click.echo(report.to_text(verbose=verbose))
     if out:
-        Path(out).write_text(json.dumps(report.to_dict(), indent=2, default=str),
-                             encoding="utf-8")
+        _write_report(
+            out, report.to_dict(compact=compact),
+            inputs={"real": real_path, "synthetic": synth_path}, spec=spec,
+            thresholds={"tolerance": tolerance},
+        )
         click.echo(f"Report written to {out}")
     sys.exit(0 if report.overall_ok else 1)
 
@@ -550,7 +615,11 @@ def diagnose(real_path: str, synth_path: str, spec_path: str, out: str,
 @click.option("--spec", "spec_path", required=True, help="Path to the Spec YAML/JSON.")
 @click.option("--data", "data", required=True,
               help="Generated dataset: a directory or file of table(s) (csv/parquet/json/jsonl).")
-def check(spec_path: str, data: str) -> None:
+@click.option("--out", default=None, type=click.Path(),
+              help="Write the JSON conformance report to this path.")
+@click.option("--compact", is_flag=True,
+              help="Write only the stable machine-readable summary to --out.")
+def check(spec_path: str, data: str, out: str | None, compact: bool) -> None:
     """Certify that generated data conforms to its Spec (PK, FK, rules, ...).
 
     The third of the three reports, and the only one that needs no real data:
@@ -568,6 +637,10 @@ def check(spec_path: str, data: str) -> None:
         sys.exit(2)
     report = validate_against_spec(frames, spec)
     click.echo(report.to_text())
+    if out:
+        _write_report(out, report.to_dict(compact=compact),
+                      inputs={"spec": spec_path, "data": data}, spec=spec)
+        click.echo(f"Report written to {out}")
     sys.exit(0 if report.overall_ok else 1)
 
 

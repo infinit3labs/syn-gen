@@ -18,7 +18,7 @@ profiling run that produced it -- which is the right object to describe.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .profiler import OTHER_BUCKET_LABEL, RECOMMENDED_MIN_CELL_COUNT
 from .spec import Spec
@@ -205,6 +205,47 @@ class DisclosureReport:
             for metric, actual, limit in checks
             if limit is not None and actual > limit
         ]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Stable machine-readable disclosure report for CI/release review."""
+        violations = []
+        return {
+            "report_type": "disclosure",
+            "report_schema_version": "1",
+            "status": "review" if self.needs_review else "clear",
+            "needs_review": self.needs_review,
+            "n_columns": self.n_columns,
+            "embedded_values": self.embedded_values,
+            "rare_values": self.rare_values,
+            "suppressed_values": self.suppressed_values,
+            "conditional_keys": self.conditional_keys,
+            "conditional_cells": self.conditional_cells,
+            "suppressed_conditional_cells": self.suppressed_conditional_cells,
+            "pii": [
+                {"table": p.table, "column": p.column,
+                 "signals": list(p.signals), "generator": p.generator}
+                for p in self.pii
+            ],
+            "categoricals": [
+                {"table": c.table, "column": c.column,
+                 "n_values": c.n_values, "rare_values": c.rare_values,
+                 "redacted": c.redacted, "suppressed": c.suppressed,
+                 "min_cell_count": c.min_cell_count}
+                for c in self.categoricals
+            ],
+            "conditionals": [
+                {"table": c.table, "determinant": list(c.determinant),
+                 "dependent": c.dependent, "n_keys": c.n_keys,
+                 "n_cells": c.n_cells, "redacted": c.redacted,
+                 "suppressed_cells": c.suppressed_cells}
+                for c in self.conditionals
+            ],
+            "key_candidates": list(self.key_candidates),
+            "numeric_ranges": self.n_numeric_ranges,
+            "empirical_histograms": self.n_empirical_histograms,
+            "datetime_ranges": self.n_datetime_ranges,
+            "string_shapes": self.n_string_shapes,
+        }
 
     # ---- construction ----------------------------------------------------
     @classmethod
