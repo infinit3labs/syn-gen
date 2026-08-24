@@ -188,6 +188,17 @@ def validate(spec_path: str, migrate_out: str | None) -> None:
 @click.option("--sample", default=5000, type=int, show_default=True,
               help="Rows to sample for profiling. Row counts, nullability and "
                    "uniqueness are always measured on the full dataset.")
+@click.option("--max-rows", "max_rows", default=None, type=int, show_default=True,
+              help="Cap the number of rows read from each input. Useful for "
+                   "profiling a sample of a file too large to hold in memory. "
+                   "Combined with --columns, applies AFTER column subsetting. "
+                   "Nullability and uniqueness are then measured on the "
+                   "capped subset, NOT the source dataset -- pair with --sample "
+                   "to control which is which.")
+@click.option("--columns", "columns", default=None,
+              help="Comma-separated column subset to read from each input. "
+                   "Useful when only a handful of the source columns are "
+                   "of interest. Applies BEFORE --max-rows.")
 @click.option("--seed", default=42, type=int, help="Seed for sampling + generation.")
 @click.option("--max-categorical", "max_categorical",
               default=DEFAULT_MAX_CATEGORICAL, type=int, show_default=True,
@@ -309,6 +320,7 @@ def validate(spec_path: str, migrate_out: str | None) -> None:
               help="Whether disclosure-budget violations stop profile output or "
                    "are emitted as warnings.")
 def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
+            max_rows: int, columns: str,
             max_categorical: int, max_categorical_ratio: float,
             min_cell_count: int, redact_categoricals: bool,
             max_unredacted_values: int, max_rare_values: int,
@@ -331,6 +343,8 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     from .profiler import DatasetProfiler
 
     pii_cols = [c.strip() for c in (pii or "").split(",") if c.strip()] or None
+    column_subset = ([c.strip() for c in columns.split(",") if c.strip()]
+                     if columns else None)
     pii_ignored = [c.strip() for c in (pii_ignore or "").split(",") if c.strip()] or None
     # profiler options threaded through every construction path below
     opts = dict(max_categorical=max_categorical,
@@ -345,24 +359,31 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
     if len(datasets) == 1:
         profiler = DatasetProfiler.from_file(
             datasets[0], name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
+            pii_columns=pii_cols, pii_strategy=pii_strategy,
+            max_rows=max_rows, columns=column_subset, **opts,
         )
         spec = profiler.profile()
     else:
         dfs = {}
+        sources = {}
         for d in datasets:
             profiler = DatasetProfiler.from_file(
                 d, sample=sample, seed=seed, pii_columns=pii_cols,
-                pii_strategy=pii_strategy, **opts,
+                pii_strategy=pii_strategy,
+                max_rows=max_rows, columns=column_subset, **opts,
             )
             dfs[profiler.name] = profiler.full
+            sources[profiler.name] = profiler.source
         spec = DatasetProfiler.profile_set(
             dfs, name=name, sample=sample, seed=seed,
-            pii_columns=pii_cols, pii_strategy=pii_strategy, **opts,
+            pii_columns=pii_cols, pii_strategy=pii_strategy,
+            max_rows=max_rows, columns=column_subset, sources=sources, **opts,
         )
     if merge_into:
-        from .profiler import merge_preserving_edits
-        spec = merge_preserving_edits(from_file(merge_into), spec)
+        from .profiler import merge_preserving_edits, MergeReport
+        merge_report = MergeReport()
+        spec = merge_preserving_edits(from_file(merge_into), spec,
+                                      report=merge_report)
     report = DisclosureReport.from_spec(spec)
     violations = report.check_budget(DisclosureBudget(
         max_unredacted_values=max_unredacted_values,
@@ -391,7 +412,9 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
                for t in spec.tables)
     n_kept = sum(
         1 for t in spec.tables
-        for prov in [t.key_provenance] + [r.provenance for r in t.relationships]
+        for prov in [t.key_provenance]
+        + [r.provenance for r in t.relationships]
+        + [c.provenance for c in t.columns]
         if prov is not None and prov.human_edited
     )
     click.echo(
@@ -430,6 +453,20 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
                    "on; every column is sampled independently")
     if merge_into:
         click.echo(f"  merged into {merge_into}: {n_kept} hand-edited rule(s) preserved")
+        if merge_report is not None:
+            mr = merge_report.to_dict()
+            for key in ("tables_added", "columns_added",
+                        "columns_removed", "columns_changed_kept",
+                        "columns_changed_reinferred"):
+                items = mr.get(key) or []
+                if not items:
+                    continue
+                n = len(items)
+                shown = ','.join('.'.join(map(str, x)) if isinstance(x, list) else str(x)
+                                 for x in items[:3])
+                more = ", ..." if n > 3 else ""
+                kind = key.rsplit('_', 1)[1]
+                click.echo(f"  {n} {kind}: {shown}{more}")
     # The disclosure summary goes to stderr, deliberately. It is a notice about
     # the artefact rather than part of it, and stderr is the stream that
     # survives `syntab profile ... | tee`, redirection and CI log capture -- the

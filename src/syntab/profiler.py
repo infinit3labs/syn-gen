@@ -15,9 +15,10 @@ import datetime as _dt
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -301,6 +302,245 @@ def _fingerprint(value: Any) -> str:
 
     payload = json.dumps(value, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _column_signature(col: ColumnSpec) -> Dict[str, Any]:
+    """The parts of a column that drift detection is allowed to compare.
+
+    Deliberately excludes ``depends_on`` and ``when`` (those reflect generator
+    wiring that the merge step rewrites on its own), and excludes ``pii`` /
+    ``pii_strategy`` / ``pii_detected_by`` (which are derived from the column
+    name and value, not the spec content; the merge step also handles them).
+    What is left is the data-facing shape: ``dtype``, ``generator``, ``params``,
+    ``constraints``, and the *normalized* profile (categorical vocabulary,
+    numeric bounds, datetime range, length) -- the things a human edits in a
+    text editor and the things a re-profile overwrites.
+    """
+    prof: Optional[Dict[str, Any]] = None
+    if col.profile is not None:
+        if col.profile.categorical is not None:
+            cat = col.profile.categorical
+            prof = {
+                "kind": "categorical",
+                "values": dict(cat.values),
+                "min_cell_count": cat.min_cell_count,
+                "suppressed_values": cat.suppressed_values,
+                "rare_value_count": cat.rare_value_count,
+                "redacted": cat.redacted,
+            }
+        elif col.profile.numeric is not None:
+            num = col.profile.numeric
+            prof = {
+                "kind": "numeric",
+                "min": num.min, "max": num.max,
+                "mean": num.mean, "std": num.std,
+                "distribution": num.distribution,
+            }
+        elif col.profile.datetime_range is not None:
+            prof = {
+                "kind": "datetime",
+                "range": (
+                    col.profile.datetime_range[0].isoformat()
+                    if col.profile.datetime_range[0] is not None else None,
+                    col.profile.datetime_range[1].isoformat()
+                    if col.profile.datetime_range[1] is not None else None,
+                ),
+            }
+        elif col.profile.length is not None:
+            prof = {"kind": "string", "length": list(col.profile.length)}
+        else:
+            prof = {"kind": "other"}
+    return {
+        "dtype": col.dtype,
+        "generator": col.generator,
+        "params": dict(col.params),
+        "constraints": dict(col.constraints),
+        "profile": prof,
+    }
+
+
+def _read_dataframe_bounded(
+    path: Union[str, "os.PathLike[str]"],
+    *,
+    max_rows: Optional[int] = None,
+    columns: Optional[Sequence[str]] = None,
+    chunksize: int = 50_000,
+) -> pd.DataFrame:
+    """Read a CSV/Parquet/JSON/JSONL/Excel file, bounded to ``max_rows`` rows.
+
+    Used by ``DatasetProfiler.from_file`` to honor ``--max-rows`` without
+    materializing the full file. The semantics this has to preserve, because
+    ``_build_table_spec`` reasons about them, are:
+
+      * the returned DataFrame holds at most ``max_rows`` rows
+      * column subsetting applies before the row cap (so ``max_rows`` is a
+        sample of the columns you asked for, not of the whole file)
+      * CSV/JSONL stream in chunks of ``chunksize``; parquet is loaded whole
+        and then truncated, since pyarrow's row-group iteration requires the
+        arrow engine; Excel is loaded whole and truncated (Excel is the
+        uncommon path and a full read is already the documented behavior).
+
+    For callers passing ``max_rows=None`` and ``columns=None`` the function
+    falls back to the previous single-call read, so the default codepath is
+    unchanged.
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    no_bounding = max_rows is None and columns is None
+    if no_bounding:
+        # Preserve the previous direct dispatch for the default case.
+        if suffix == ".parquet":
+            return pd.read_parquet(p)
+        if suffix in (".csv", ".txt"):
+            return pd.read_csv(p)
+        if suffix == ".tsv":
+            return pd.read_csv(p, sep="\t")
+        if suffix == ".jsonl":
+            return pd.read_json(p, lines=True)
+        if suffix == ".json":
+            return pd.read_json(p)
+        if suffix in (".xlsx", ".xls"):
+            return pd.read_excel(p)
+        raise ValueError(f"Unsupported data file: {p.suffix}")
+
+    # CSV / TSV / JSONL: stream-merge chunks.
+    if suffix in (".csv", ".txt", ".tsv", ".jsonl"):
+        # ``pd.read_json(..., lines=True)`` is JSONL; ``.json`` is array-of-records.
+        if suffix == ".jsonl":
+            reader = pd.read_json(p, lines=True, chunksize=chunksize)
+        else:
+            reader = pd.read_csv(
+                p, sep="\t" if suffix == ".tsv" else ",", chunksize=chunksize
+            )
+        frames: List[pd.DataFrame] = []
+        taken = 0
+        for i, chunk in enumerate(reader):
+            if columns is not None:
+                if i == 0:
+                    missing = [c for c in columns if c not in chunk.columns]
+                    if missing:
+                        raise ValueError(
+                            f"--columns requested column(s) not found in "
+                            f"{p}: {missing}"
+                        )
+                chunk = chunk[[c for c in columns if c in chunk.columns]]
+            if max_rows is not None:
+                remaining = max_rows - taken
+                if remaining <= 0:
+                    break
+                if len(chunk) > remaining:
+                    chunk = chunk.iloc[:remaining]
+            frames.append(chunk)
+            taken += len(chunk)
+            if max_rows is not None and taken >= max_rows:
+                break
+        if not frames:
+            cols = list(columns) if columns is not None else []
+            return pd.DataFrame(columns=cols)
+        out = pd.concat(frames, ignore_index=True)
+        if columns is not None:
+            out = out[[c for c in columns if c in out.columns]]
+        return out
+
+    # JSON array-of-records and Excel: load whole, then bound. These are the
+    # formats where pandas does not expose a chunksize and the files are
+    # typically small. Documented above.
+    if suffix == ".json":
+        df = pd.read_json(p)
+    elif suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(p)
+    else:
+        raise ValueError(f"Unsupported data file: {p.suffix}")
+    if columns is not None:
+        missing = [c for c in columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"--columns requested column(s) not found in {p}: {missing}"
+            )
+        df = df[[c for c in columns if c in df.columns]]
+    if max_rows is not None and len(df) > max_rows:
+        df = df.iloc[:max_rows]
+    return df
+
+
+def _source_fingerprint(
+    *,
+    source: str,
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Provenance for the input data: where it came from, what it was.
+
+    A hash of the path + a stat on the file when one exists, plus the row
+    count of whatever actually got profiled (which may already be bounded by
+    ``--max-rows``). This is the handle a reviewer of a spec can use to
+    answer "is the spec I am looking at about the file I think it is?"
+    without opening the spec and matching the source label by eye.
+    """
+    out: Dict[str, Any] = {
+        "source": source,
+        "profiled_rows": int(len(df)),
+    }
+    try:
+        p = Path(source)
+        if p.exists() and p.is_file():
+            st = p.stat()
+            out["source_path"] = str(p)
+            out["source_size_bytes"] = int(st.st_size)
+            out["source_mtime"] = int(st.st_mtime)
+    except (OSError, ValueError):
+        # In-memory frames and any path that is not a real file. The
+        # ``profiled_rows`` field is still useful, and that is the point.
+        pass
+    return out
+
+
+class MergeReport:
+    """Summary of what a merge_preserving_edits call did.
+
+    Attached to the merged spec's ``metadata["merge"]`` so the CLI can report
+    it without re-walking the spec, and so a later review of the file sees
+    what was kept, what was overwritten, and what was added.
+    """
+
+    __slots__ = (
+        "tables_kept",
+        "tables_added",
+        "tables_removed",
+        "columns_added",
+        "columns_removed",
+        "columns_changed_kept",
+        "columns_changed_reinferred",
+        "keys_preserved",
+        "relationships_preserved",
+        "columns_preserved",
+    )
+
+    def __init__(self) -> None:
+        self.tables_kept: List[str] = []
+        self.tables_added: List[str] = []
+        self.tables_removed: List[str] = []
+        self.columns_added: List[Tuple[str, str]] = []   # (table, column)
+        self.columns_removed: List[Tuple[str, str]] = []
+        self.columns_changed_kept: List[Tuple[str, str]] = []
+        self.columns_changed_reinferred: List[Tuple[str, str]] = []
+        self.keys_preserved: List[str] = []
+        self.relationships_preserved: List[str] = []
+        self.columns_preserved: List[str] = []
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tables_kept": list(self.tables_kept),
+            "tables_added": list(self.tables_added),
+            "tables_removed": list(self.tables_removed),
+            "columns_added": [list(x) for x in self.columns_added],
+            "columns_removed": [list(x) for x in self.columns_removed],
+            "columns_changed_kept": [list(x) for x in self.columns_changed_kept],
+            "columns_changed_reinferred": [list(x)
+                                          for x in self.columns_changed_reinferred],
+            "keys_preserved": list(self.keys_preserved),
+            "relationships_preserved": list(self.relationships_preserved),
+            "columns_preserved": list(self.columns_preserved),
+        }
 
 
 def _table_name_forms(table: str) -> set:
@@ -590,9 +830,10 @@ def pii_name_signal(name: str) -> Optional[str]:
 #                             keep it, on the principle that an unexplained
 #                             rule is more likely a person's than a machine's
 #
-# Scope: this covers what discovery writes -- the primary key and the
-# relationships. Column-level edits (a corrected dtype, a pii flag, an edited
-# categorical distribution) are NOT preserved yet; see the PR description.
+# Scope: originally just the primary key and the relationships. INF-225
+# extended the same fingerprint scheme to columns -- a corrected dtype, an
+# edited categorical distribution -- via ``ColumnSpec.provenance``. See
+# ``merge_preserving_edits`` below for exactly how a column is judged.
 
 
 def _provenance_is_stale(prov, current_value) -> bool:
@@ -658,14 +899,43 @@ def schema_drift(existing: Spec, profiled: Spec) -> Dict[str, Dict[str, Any]]:
     return result
 
 
-def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
+def merge_preserving_edits(
+    existing: Spec,
+    profiled: Spec,
+    *,
+    report: Optional[MergeReport] = None,
+) -> Spec:
     """Fold a fresh profile into an existing spec, keeping human corrections.
 
     Returns a new Spec; neither argument is mutated. Tables and relationships
     the fresh profile found but the existing spec does not have are added --
     the point of re-profiling is to learn something new, so a merge that only
     ever preserved would be as useless as one that only ever overwrote.
+
+    Column-level drift handling (INF-225). The fingerprinting scheme that
+    protects primary keys and relationships is now extended to columns:
+
+      * **added** (a column the fresh profile found but the old spec did
+        not have) is taken from the fresh profile, unchanged;
+      * **removed** (a column in the old spec but not in the fresh profile)
+        is kept and marked ``human_edited``, on the principle that a column
+        a person wrote by hand is not a column a missing source column
+        should silently delete;
+      * **changed** (a column in both, with a different shape) is kept if
+        the column already carried a fingerprint that no longer matches --
+        i.e. a human edited it -- and re-inferred otherwise. The check
+        covers ``dtype``, ``generator``, ``params``, ``constraints``, and
+        the column profile; see ``_column_signature``.
+
+    A ``MergeReport`` summarising the merge is attached to the returned
+    spec's ``metadata["merge"]`` and is also returned via the ``report``
+    argument when one is passed in. When ``report`` is None, a fresh
+    ``MergeReport`` is created. Existing callers that do not look at the
+    report are unaffected.
     """
+    if report is None:
+        report = MergeReport()
+
     merged = profiled.model_copy(deep=True)
     drift = schema_drift(existing, profiled)
     old_tables = {t.name: t for t in existing.tables}
@@ -678,7 +948,10 @@ def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
             table.metadata["profiling"] = profiling
         old = old_tables.get(table.name)
         if old is None:
+            report.tables_added.append(table.name)
             continue
+
+        report.tables_kept.append(table.name)
 
         # ----- primary key -----
         keep_key = (
@@ -690,6 +963,9 @@ def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
         if keep_key:
             table.primary_key = old.primary_key
             table.key_provenance = _mark_edited(old.key_provenance)
+            report.keys_preserved.append(
+                f"{table.name}.{old.primary_key!r}"
+            )
 
         # ----- relationships, matched on the child column(s) -----
         old_rels = {tuple(r.child_columns): r for r in old.relationships}
@@ -709,15 +985,82 @@ def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
 
         fresh = [r for r in table.relationships
                  if tuple(r.child_columns) not in kept]
+        for rel in kept.values():
+            report.relationships_preserved.append(
+                f"{table.name}.{rel.from_!r}->{rel.to}"
+            )
         table.relationships = list(kept.values()) + fresh
 
+        # ----- columns: drift detection on the column shape -----
+        old_cols = {c.name: c for c in old.columns}
+        new_cols: List[ColumnSpec] = []
+        for col in table.columns:
+            old_col = old_cols.get(col.name)
+            if old_col is None:
+                # Added by the new profile.
+                report.columns_added.append((table.name, col.name))
+                new_cols.append(col)
+                continue
+            old_sig = _column_signature(old_col)
+            new_sig = _column_signature(col)
+            if old_sig == new_sig:
+                # No drift: keep the fresh column as-is. A no-op merge is
+                # reported as preserved so the CLI can give an honest
+                # "nothing changed" signal.
+                new_cols.append(col)
+                report.columns_preserved.append(f"{table.name}.{col.name}")
+                continue
+            # Drift. The column was in both specs, but its shape changed.
+            # Same rule as the primary key and relationships above: keep the
+            # human's version when the old column's fingerprint no longer
+            # matches what is actually there (a human edited it since the
+            # profiler wrote it) or it carries no fingerprint at all
+            # (hand-authored). Otherwise the drift is a real source change
+            # and the fresh column wins. A subsequent re-profile that finds
+            # the column stable will then show ``columns_preserved`` -- so a
+            # repeated re-profile converges.
+            keep_col = (
+                old_col.provenance is None
+                or old_col.provenance.human_edited
+                or _provenance_is_stale(old_col.provenance, old_sig)
+            )
+            if keep_col:
+                preserved = old_col.model_copy(deep=True)
+                preserved.provenance = _mark_edited(old_col.provenance)
+                new_cols.append(preserved)
+                report.columns_changed_kept.append((table.name, col.name))
+            else:
+                new_cols.append(col)
+                report.columns_changed_reinferred.append(
+                    (table.name, col.name)
+                )
+
+        # ----- columns removed by the new profile are kept -----
+        new_col_names = {c.name for c in new_cols}
+        for old_name, old_col in old_cols.items():
+            if old_name not in new_col_names:
+                # A column the old spec had and the new profile did not.
+                # Kept, and recorded as removed-by-profile so a review of
+                # the merge report sees it. The next re-profile that
+                # still does not see the column will keep it again,
+                # because the spec-to-spec merge is the merge's source of
+                # truth.
+                new_cols.append(old_col.model_copy(deep=True))
+                report.columns_removed.append((table.name, old_name))
+
+        table.columns = new_cols
+
     # Tables the existing spec has and the fresh profile does not are kept:
-    # a source that was not re-read is not a source that went away.
+    # a source that was not re-read is not a source that went away. The
+    # report records them as removed-by-profile, distinct from
+    # tables_kept (which are present in both).
     profiled_names = {t.name for t in merged.tables}
     for name, old in old_tables.items():
         if name not in profiled_names:
             merged.tables.append(old.model_copy(deep=True))
+            report.tables_removed.append(name)
 
+    merged.metadata = merged.metadata.model_copy(update={"merge": report.to_dict()})
     return merged
 
 
@@ -746,6 +1089,13 @@ class DatasetProfiler:
         discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
         condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
         conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
+        # INF-225: bounded-memory resource controls. ``max_rows`` caps the
+        # number of rows kept in memory after the read; ``columns`` selects
+        # a subset of the file before the row cap. Both default to ``None``
+        # (no cap), so existing call sites are unchanged. ``max_rows=0`` is
+        # rejected as almost-certainly-a-mistake at validation time.
+        max_rows: Optional[int] = None,
+        columns: Optional[Sequence[str]] = None,
     ):
         self._validate_controls(
             sample=sample,
@@ -753,6 +1103,7 @@ class DatasetProfiler:
             max_categorical_ratio=max_categorical_ratio,
             max_categorical_ratio_cap=max_categorical_ratio_cap,
             min_cell_count=min_cell_count,
+            max_rows=max_rows,
         )
         self.full = df
         self.name = name or "profiled"
@@ -769,6 +1120,13 @@ class DatasetProfiler:
         self.min_cell_count = max(0, int(min_cell_count))
         if discover is True and not discovery.is_available():
             discovery.require_desbordante()  # raises with an actionable message
+        # ``_user_discover`` records the value the caller passed, distinct
+        # from ``self.discover`` which is the constructor's resolved value
+        # (auto -> True when discovery is installed, else False). The
+        # controls block in the emitted spec records *what the user did*,
+        # not what the run resolved to, so a future maintainer can tell
+        # whether a spec was profiled with explicit ``--no-discover``.
+        self._user_discover = discover
         self.discover = (
             discovery.is_available() if discover is None else bool(discover)
         )
@@ -781,6 +1139,8 @@ class DatasetProfiler:
         # Conditioning is only meaningful when FDs were actually discovered.
         self.condition_on_fds = bool(condition_on_fds) and self.discover_fds
         self.conditional_fd_error = conditional_fd_error
+        self.max_rows = max_rows
+        self.columns = list(columns) if columns is not None else None
         # id-like columns whose base name looks identifying (patient_id). Not
         # auto-flagged -- see pii_name_signal -- but surfaced for review.
         self.identifying_key_candidates: List[str] = []
@@ -796,6 +1156,7 @@ class DatasetProfiler:
         max_categorical_ratio: float,
         max_categorical_ratio_cap: int,
         min_cell_count: int,
+        max_rows: Optional[int] = None,
     ) -> None:
         """Reject profiling controls that would be invalid or unbounded."""
         if sample is not None and (not isinstance(sample, int) or sample < 0):
@@ -812,6 +1173,10 @@ class DatasetProfiler:
             )
         if not isinstance(min_cell_count, int) or min_cell_count < 0:
             raise ValueError("profiling control 'min_cell_count' must be non-negative")
+        if max_rows is not None and (not isinstance(max_rows, int) or max_rows <= 0):
+            raise ValueError(
+                "profiling control 'max_rows' must be a positive integer or None"
+            )
 
     # ----- PII helpers -----
     #
@@ -874,23 +1239,33 @@ class DatasetProfiler:
 
     # ----- factory -----
     @classmethod
-    def from_file(cls, path: str, **kw) -> "DatasetProfiler":
+    def from_file(
+        cls,
+        path: str,
+        *,
+        max_rows: Optional[int] = None,
+        columns: Optional[Sequence[str]] = None,
+        **kw,
+    ) -> "DatasetProfiler":
+        """Read ``path`` and build a profiler.
+
+        ``max_rows`` and ``columns`` are the INF-225 resource controls. The
+        default of ``None``/``None`` keeps the previous behavior: the file is
+        loaded whole, no column subsetting, no row cap. Setting either routes
+        through :func:`_read_dataframe_bounded`, which uses
+        ``pd.read_csv(chunksize=...)`` for CSV/TSV/JSONL and falls back to
+        load-then-truncate for JSON/Excel (the formats pandas does not
+        chunked-read). See ``docs/profiling.md``.
+        """
+        df = _read_dataframe_bounded(path, max_rows=max_rows, columns=columns)
         p = Path(path)
-        if p.suffix.lower() == ".parquet":
-            df = pd.read_parquet(p)
-        elif p.suffix.lower() in (".csv", ".txt"):
-            df = pd.read_csv(p)
-        elif p.suffix.lower() == ".json":
-            df = pd.read_json(p)
-        elif p.suffix.lower() in (".xlsx", ".xls"):
-            df = pd.read_excel(p)
-        else:
-            raise ValueError(f"Unsupported data file: {p.suffix}")
         name = kw.pop("name", None) or p.stem
-        return cls(df, name=name, source=str(p), **kw)
+        return cls(df, name=name, source=str(p),
+                   max_rows=max_rows, columns=columns, **kw)
 
     # ----- public -----
     def profile(self) -> Spec:
+        from . import __version__ as _syntab_version
         table = self._build_table_spec(self.full, self.name, self.source)
         meta = SpecMetadata(
             name=self.name,
@@ -900,6 +1275,7 @@ class DatasetProfiler:
             # A profile is a reproducible build artifact. Timestamps belong in
             # the caller's run log, not in the serialized spec itself.
             created_at=None,
+            syntab_version=_syntab_version,
         )
         return Spec(
             metadata=meta,
@@ -929,6 +1305,15 @@ class DatasetProfiler:
         unique_constraints = self._composite_unique_constraints(uccs, pk)
         fds = self._discover_fds(df)
         conditionals = self._apply_conditional_generation(df, cols, pk)
+        # Fingerprint every column's final shape -- after conditional
+        # generation, which can still change ``generator``/``params`` -- so
+        # a later re-profile can tell a human edit from an untouched column.
+        # See ``merge_preserving_edits``.
+        for col in cols:
+            col.provenance = InferenceProvenance(
+                algorithm="profile-column",
+                fingerprint=_fingerprint(_column_signature(col)),
+            )
         # ``row_count`` is the size of the SOURCE dataset, not of whatever
         # sample we happened to read. It is the contract "a dataset of this
         # shape has this many rows", and ``syntab check`` compares generated
@@ -938,6 +1323,14 @@ class DatasetProfiler:
         #
         # How much was actually read is provenance, so it is recorded
         # separately under ``metadata.profiling``. Nothing compares against it.
+        #
+        # INF-225: the block below is the full reproducibility contract.
+        # Anything that affects what comes out of ``_build_table_spec`` is
+        # recorded: the full set of profiling controls (not just sample/seed),
+        # the syntab package version that produced the spec, and a handle on
+        # the source data the spec was written from. A reader of the spec can
+        # therefore tell, without re-running anything, what knobs were turned
+        # and what the spec is about.
         profiling_metadata = {
             "source_row_count": source_rows,
             "sampled_rows": n,
@@ -956,6 +1349,80 @@ class DatasetProfiler:
             profiling_metadata["identifying_key_candidates"] = list(
                 self.identifying_key_candidates
             )
+        # Full set of profiling controls the user actually turned. Only
+        # values that differ from the profiler's own default are recorded,
+        # so the spec stays as quiet as it was before this change for the
+        # default-options case. The dict is what reproducibility needs: a
+        # reader can tell, without re-running anything, what knobs were
+        # moved off the defaults that produced this spec.
+        #
+        # ``sample``/``seed`` are deliberately NOT in this dict: they are
+        # always recorded above, unconditionally when set, under
+        # ``requested_sample``/``seed``. The CLI always passes an explicit
+        # seed (default 42), so there is no "unset" state to compare
+        # against, and putting them here as well would grow every default
+        # CLI run's spec -- exactly what "non-default only" promises not to
+        # do.
+        non_default = {
+            "max_categorical": (self.max_categorical
+                                if self.max_categorical != DEFAULT_MAX_CATEGORICAL
+                                else None),
+            "max_categorical_ratio": (self.max_categorical_ratio
+                                      if self.max_categorical_ratio
+                                      != DEFAULT_MAX_CATEGORICAL_RATIO
+                                      else None),
+            "max_categorical_ratio_cap": (self.max_categorical_ratio_cap
+                                          if self.max_categorical_ratio_cap
+                                          != DEFAULT_MAX_CATEGORICAL_RATIO_CAP
+                                          else None),
+            "min_cell_count": (self.min_cell_count
+                               if self.min_cell_count != DEFAULT_MIN_CELL_COUNT
+                               else None),
+            "redact_categoricals": (True if self.redact_categoricals else None),
+            "pii_strategy": (self.pii_strategy
+                             if self.pii_strategy != "faker" else None),
+            # ``discover`` records what the user explicitly passed, not
+            # what the constructor resolved to. Default (``None`` / "auto")
+            # is omitted; explicit ``True`` or ``False`` is recorded.
+            "discover": (self._user_discover
+                         if self._user_discover is not None else None),
+            "discover_fds": (True if self.discover_fds else None),
+            "condition_on_fds": (True if self.condition_on_fds else None),
+            "fd_error": (self.fd_error
+                         if self.fd_error != discovery.DEFAULT_FD_ERROR else None),
+            "fd_min_mu": (self.fd_min_mu
+                          if self.fd_min_mu != discovery.DEFAULT_MIN_MU else None),
+            "ind_error": (self.ind_error
+                          if self.ind_error != discovery.DEFAULT_IND_ERROR else None),
+            "conditional_fd_error": (self.conditional_fd_error
+                                     if self.conditional_fd_error
+                                     != discovery.DEFAULT_CONDITIONAL_FD_ERROR
+                                     else None),
+            "discovery_sample_rows": (self.discovery_sample_rows
+                                      if self.discovery_sample_rows
+                                      != discovery.DEFAULT_SAMPLE_ROWS else None),
+            "discovery_max_lhs": (self.discovery_max_lhs
+                                  if self.discovery_max_lhs
+                                  != discovery.DEFAULT_MAX_LHS else None),
+            "max_rows": self.max_rows,
+            "columns": self.columns,
+        }
+        profiling_metadata["controls"] = {
+            k: v for k, v in non_default.items() if v is not None
+        }
+        # Omit ``controls`` entirely when the user did not move any knob off
+        # its default. The default-options case is the common one, and
+        # emitting an empty mapping would fail the no-noise serialization
+        # contract enforced in ``test_spec_serialization``.
+        if not profiling_metadata["controls"]:
+            del profiling_metadata["controls"]
+        profiling_metadata["source"] = _source_fingerprint(
+            source=source, df=df,
+        )
+        # ``syntab_version`` is recorded at the spec level, not per-table, so
+        # a multi-table profile only records it once. Set by ``profile()``
+        # and ``profile_set()``.
+        #
         # A stable, non-reversible run fingerprint makes it possible to tell
         # whether a spec was rebuilt from the same input shape/sample without
         # embedding source values in the artifact.  Hash only bounded sample
@@ -1032,6 +1499,9 @@ class DatasetProfiler:
         discovery_max_lhs: int = discovery.DEFAULT_MAX_LHS,
         condition_on_fds: bool = DEFAULT_CONDITION_ON_FDS,
         conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
+        max_rows: Optional[int] = None,
+        columns: Optional[Sequence[str]] = None,
+        sources: Optional[Dict[str, str]] = None,
     ) -> Spec:
         """Profile several related tables and discover foreign keys.
 
@@ -1040,9 +1510,16 @@ class DatasetProfiler:
         See ``_relationships_from_inds`` for how an IND becomes a foreign key,
         and ``_relationships_from_names`` for the name-based rule that is now
         only the fallback for when the optional discovery extra is absent.
+
+        ``sources`` maps table name -> the file path (or other source label)
+        each ``DataFrame`` came from, so ``metadata.profiling.source`` in the
+        emitted spec records real per-table provenance instead of falling
+        back to the table name. Optional: a caller with only in-memory frames
+        and no file identity can omit it.
         """
         profilers = {
-            t: cls(df, name=t, sample=sample, seed=seed,
+            t: cls(df, name=t, source=(sources or {}).get(t),
+                   sample=sample, seed=seed,
                    max_categorical=max_categorical,
                    max_categorical_ratio=max_categorical_ratio,
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
@@ -1056,11 +1533,12 @@ class DatasetProfiler:
                    discovery_sample_rows=discovery_sample_rows,
                    discovery_max_lhs=discovery_max_lhs,
                    condition_on_fds=condition_on_fds,
-                   conditional_fd_error=conditional_fd_error)
+                   conditional_fd_error=conditional_fd_error,
+                   max_rows=max_rows, columns=columns)
             for t, df in tables.items()
         }
         table_specs = {
-            t: profilers[t]._build_table_spec(df, t, f"profiled:{t}")
+            t: profilers[t]._build_table_spec(df, t, profilers[t].source)
             for t, df in tables.items()
         }
         any_profiler = next(iter(profilers.values()), None)
@@ -1077,6 +1555,7 @@ class DatasetProfiler:
             tags=["profiled", "multi-table"],
             source=f"profiled:{list(tables)}",
             created_at=None,
+            syntab_version=__import__("syntab").__version__,
         )
         return Spec(
             metadata=meta,
