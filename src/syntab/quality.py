@@ -91,6 +91,11 @@ REPORT_SCHEMA_VERSION = "1"
 # sample gives the same answer for a fraction of the work.
 DEFAULT_SUBSAMPLE = 50_000
 
+# Hard bound on the number of column pairs scored by default. This keeps the
+# pair-trend pass predictable for wide tables while preserving every pair for
+# ordinary-width tables (the default covers all pairs through 45 columns).
+DEFAULT_MAX_PAIR_TRENDS = 1_000
+
 # Number of bins used to discretize a continuous column before computing
 # ContingencySimilarity. Matches the SDMetrics default.
 NUM_DISCRETE_BINS = 10
@@ -492,6 +497,12 @@ class QualityReport:
     #: Key columns held out of the graded properties. Reported rather than
     #: dropped silently, so the exclusion is visible in the output.
     excluded_key_columns: List[str] = field(default_factory=list)
+    #: Total eligible pairs before applying the pair-trend budget.
+    pair_trends_total: int = 0
+    #: Number of eligible pairs actually scored.
+    pair_trends_scored: int = 0
+    #: Whether the pair-trend budget omitted eligible pairs.
+    pair_trends_truncated: bool = False
 
     @property
     def overall_score(self) -> float:
@@ -518,6 +529,11 @@ class QualityReport:
             "excluded_key_columns": list(self.excluded_key_columns),
             "real_rows": self.real_rows,
             "synthetic_rows": self.synthetic_rows,
+            "pair_trends": {
+                "total": self.pair_trends_total,
+                "scored": self.pair_trends_scored,
+                "truncated": self.pair_trends_truncated,
+            },
         }
         if compact:
             return summary
@@ -570,6 +586,11 @@ class QualityReport:
             lines.append(
                 "    Key columns excluded (checked by KeyUniqueness in "
                 f"`syntab diagnose`): {', '.join(self.excluded_key_columns)}")
+        if self.pair_trends_truncated:
+            lines.append(
+                f"    Column Pair Trends truncated: scored "
+                f"{self.pair_trends_scored} of {self.pair_trends_total} "
+                "eligible pairs (deterministic sample)")
         if verbose:
             for p in self.properties:
                 lines += ["", f"  {p.name} -- {p.description}",
@@ -781,6 +802,7 @@ def quality_report(
     sample: Optional[int] = DEFAULT_SUBSAMPLE,
     seed: int = 0,
     pair_trends: bool = True,
+    max_pair_trends: Optional[int] = DEFAULT_MAX_PAIR_TRENDS,
 ) -> QualityReport:
     """Score how closely ``synthetic`` resembles ``real``. Graded, 0..1.
 
@@ -801,7 +823,13 @@ def quality_report(
 
     ``sample`` bounds the row count used for the quadratic pair-trend pass
     and the character-distribution metrics; ``None`` disables subsampling.
+    ``max_pair_trends`` bounds the number of column pairs scored. If the
+    eligible pair count exceeds the bound, a deterministic subset selected
+    from ``seed`` is scored and the report discloses the truncation. ``None``
+    disables the pair bound.
     """
+    if max_pair_trends is not None and max_pair_trends < 0:
+        raise ValueError("max_pair_trends must be non-negative or None")
     cols = _shared_columns(real, synthetic)
     # Key columns are excluded from every graded property, matching SDMetrics'
     # treatment of the `id` sdtype -- it appears in none of its property
@@ -868,24 +896,36 @@ def quality_report(
         "Column Pair Trends",
         "Relationships BETWEEN columns (CorrelationSimilarity / "
         "ContingencySimilarity). The property a marginals-only check misses.")
+    pair_trends_total = 0
+    pair_trends_scored = 0
+    pair_trends_truncated = False
     if pair_trends:
         scorable = [c for c in cols if kinds[c] != "text"]
         r_s = _subsample(real, sample, seed)
         s_s = _subsample(synthetic, sample, seed)
-        for i, c1 in enumerate(scorable):
-            for c2 in scorable[i + 1:]:
-                k1, k2 = kinds[c1], kinds[c2]
-                pair = f"{c1} | {c2}"
-                if k1 in _CONTINUOUS and k2 in _CONTINUOUS:
-                    trends.results.append(MetricResult(
-                        pair, "CorrelationSimilarity",
-                        correlation_similarity(r_s[[c1, c2]], s_s[[c1, c2]])))
-                else:
-                    continuous = [c for c in (c1, c2) if kinds[c] in _CONTINUOUS]
-                    trends.results.append(MetricResult(
-                        pair, "ContingencySimilarity",
-                        contingency_similarity(
-                            r_s[[c1, c2]], s_s[[c1, c2]], continuous)))
+        pairs = [(c1, c2) for i, c1 in enumerate(scorable)
+                 for c2 in scorable[i + 1:]]
+        pair_trends_total = len(pairs)
+        if max_pair_trends is not None and len(pairs) > max_pair_trends:
+            rng = np.random.default_rng(seed)
+            selected = np.sort(rng.choice(len(pairs), size=max_pair_trends,
+                                          replace=False))
+            pairs = [pairs[i] for i in selected]
+            pair_trends_truncated = True
+        pair_trends_scored = len(pairs)
+        for c1, c2 in pairs:
+            k1, k2 = kinds[c1], kinds[c2]
+            pair = f"{c1} | {c2}"
+            if k1 in _CONTINUOUS and k2 in _CONTINUOUS:
+                trends.results.append(MetricResult(
+                    pair, "CorrelationSimilarity",
+                    correlation_similarity(r_s[[c1, c2]], s_s[[c1, c2]])))
+            else:
+                continuous = [c for c in (c1, c2) if kinds[c] in _CONTINUOUS]
+                trends.results.append(MetricResult(
+                    pair, "ContingencySimilarity",
+                    contingency_similarity(
+                        r_s[[c1, c2]], s_s[[c1, c2]], continuous)))
 
     properties = [shapes, trends, coverage, boundary, missing]
     return QualityReport(
@@ -893,6 +933,9 @@ def quality_report(
         real_rows=len(real),
         synthetic_rows=len(synthetic),
         excluded_key_columns=excluded_keys,
+        pair_trends_total=pair_trends_total,
+        pair_trends_scored=pair_trends_scored,
+        pair_trends_truncated=pair_trends_truncated,
     )
 
 

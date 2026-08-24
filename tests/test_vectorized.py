@@ -68,6 +68,17 @@ def test_vectorized_one_to_one_fk():
     assert validate_against_spec(frames, spec).overall_ok
 
 
+def test_vectorized_standalone_fk_generator():
+    spec = _vectorizable_spec()
+    events = spec.tables[1]
+    events.relationships = []
+    events.columns[1].params = {"ref": "users.id"}
+
+    frames = GenerationEngine(spec).run(vectorized=True).to_frames()
+
+    assert set(frames["events"]["user_id"]).issubset(set(frames["users"]["id"]))
+
+
 def test_rule_table_falls_back_gracefully():
     spec = _vectorizable_spec()
     spec.tables[1].rules = ["amount > 0"]
