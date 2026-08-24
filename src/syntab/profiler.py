@@ -392,6 +392,10 @@ def _read_dataframe_bounded(
             return pd.read_parquet(p)
         if suffix in (".csv", ".txt"):
             return pd.read_csv(p)
+        if suffix == ".tsv":
+            return pd.read_csv(p, sep="\t")
+        if suffix == ".jsonl":
+            return pd.read_json(p, lines=True)
         if suffix == ".json":
             return pd.read_json(p)
         if suffix in (".xlsx", ".xls"):
@@ -399,17 +403,25 @@ def _read_dataframe_bounded(
         raise ValueError(f"Unsupported data file: {p.suffix}")
 
     # CSV / TSV / JSONL: stream-merge chunks.
-    if suffix in (".csv", ".txt", ".jsonl"):
+    if suffix in (".csv", ".txt", ".tsv", ".jsonl"):
         # ``pd.read_json(..., lines=True)`` is JSONL; ``.json`` is array-of-records.
-        reader = (
-            pd.read_json(p, lines=True, chunksize=chunksize)
-            if suffix == ".jsonl"
-            else pd.read_csv(p, chunksize=chunksize)
-        )
+        if suffix == ".jsonl":
+            reader = pd.read_json(p, lines=True, chunksize=chunksize)
+        else:
+            reader = pd.read_csv(
+                p, sep="\t" if suffix == ".tsv" else ",", chunksize=chunksize
+            )
         frames: List[pd.DataFrame] = []
         taken = 0
-        for chunk in reader:
+        for i, chunk in enumerate(reader):
             if columns is not None:
+                if i == 0:
+                    missing = [c for c in columns if c not in chunk.columns]
+                    if missing:
+                        raise ValueError(
+                            f"--columns requested column(s) not found in "
+                            f"{p}: {missing}"
+                        )
                 chunk = chunk[[c for c in columns if c in chunk.columns]]
             if max_rows is not None:
                 remaining = max_rows - taken
@@ -439,6 +451,11 @@ def _read_dataframe_bounded(
     else:
         raise ValueError(f"Unsupported data file: {p.suffix}")
     if columns is not None:
+        missing = [c for c in columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"--columns requested column(s) not found in {p}: {missing}"
+            )
         df = df[[c for c in columns if c in df.columns]]
     if max_rows is not None and len(df) > max_rows:
         df = df.iloc[:max_rows]
@@ -812,9 +829,10 @@ def pii_name_signal(name: str) -> Optional[str]:
 #                             keep it, on the principle that an unexplained
 #                             rule is more likely a person's than a machine's
 #
-# Scope: this covers what discovery writes -- the primary key and the
-# relationships. Column-level edits (a corrected dtype, a pii flag, an edited
-# categorical distribution) are NOT preserved yet; see the PR description.
+# Scope: originally just the primary key and the relationships. INF-225
+# extended the same fingerprint scheme to columns -- a corrected dtype, an
+# edited categorical distribution -- via ``ColumnSpec.provenance``. See
+# ``merge_preserving_edits`` below for exactly how a column is judged.
 
 
 def _provenance_is_stale(prov, current_value) -> bool:
@@ -938,16 +956,29 @@ def merge_preserving_edits(
                 report.columns_preserved.append(f"{table.name}.{col.name}")
                 continue
             # Drift. The column was in both specs, but its shape changed.
-            # A column the user deleted from a text editor is not silently
-            # restored, and a column whose dtype really did change in the
-            # source is updated. The fresh column wins; the drift is
-            # recorded. A subsequent re-profile that finds the column
-            # stable will then show ``columns_preserved`` -- so a
+            # Same rule as the primary key and relationships above: keep the
+            # human's version when the old column's fingerprint no longer
+            # matches what is actually there (a human edited it since the
+            # profiler wrote it) or it carries no fingerprint at all
+            # (hand-authored). Otherwise the drift is a real source change
+            # and the fresh column wins. A subsequent re-profile that finds
+            # the column stable will then show ``columns_preserved`` -- so a
             # repeated re-profile converges.
-            new_cols.append(col)
-            report.columns_changed_reinferred.append(
-                (table.name, col.name)
+            keep_col = (
+                old_col.provenance is None
+                or old_col.provenance.human_edited
+                or _provenance_is_stale(old_col.provenance, old_sig)
             )
+            if keep_col:
+                preserved = old_col.model_copy(deep=True)
+                preserved.provenance = _mark_edited(old_col.provenance)
+                new_cols.append(preserved)
+                report.columns_changed_kept.append((table.name, col.name))
+            else:
+                new_cols.append(col)
+                report.columns_changed_reinferred.append(
+                    (table.name, col.name)
+                )
 
         # ----- columns removed by the new profile are kept -----
         new_col_names = {c.name for c in new_cols}
@@ -1217,6 +1248,15 @@ class DatasetProfiler:
         unique_constraints = self._composite_unique_constraints(uccs, pk)
         fds = self._discover_fds(df)
         conditionals = self._apply_conditional_generation(df, cols, pk)
+        # Fingerprint every column's final shape -- after conditional
+        # generation, which can still change ``generator``/``params`` -- so
+        # a later re-profile can tell a human edit from an untouched column.
+        # See ``merge_preserving_edits``.
+        for col in cols:
+            col.provenance = InferenceProvenance(
+                algorithm="profile-column",
+                fingerprint=_fingerprint(_column_signature(col)),
+            )
         # ``row_count`` is the size of the SOURCE dataset, not of whatever
         # sample we happened to read. It is the contract "a dataset of this
         # shape has this many rows", and ``syntab check`` compares generated
@@ -1253,9 +1293,15 @@ class DatasetProfiler:
         # default-options case. The dict is what reproducibility needs: a
         # reader can tell, without re-running anything, what knobs were
         # moved off the defaults that produced this spec.
+        #
+        # ``sample``/``seed`` are deliberately NOT in this dict: they are
+        # always recorded above, unconditionally when set, under
+        # ``requested_sample``/``seed``. The CLI always passes an explicit
+        # seed (default 42), so there is no "unset" state to compare
+        # against, and putting them here as well would grow every default
+        # CLI run's spec -- exactly what "non-default only" promises not to
+        # do.
         non_default = {
-            "sample": self.sample,
-            "seed": self.seed,
             "max_categorical": (self.max_categorical
                                 if self.max_categorical != DEFAULT_MAX_CATEGORICAL
                                 else None),
@@ -1309,7 +1355,7 @@ class DatasetProfiler:
         if not profiling_metadata["controls"]:
             del profiling_metadata["controls"]
         profiling_metadata["source"] = _source_fingerprint(
-            source=self.source, df=self.full,
+            source=source, df=df,
         )
         # ``syntab_version`` is recorded at the spec level, not per-table, so
         # a multi-table profile only records it once. Set by ``profile()``
@@ -1357,6 +1403,7 @@ class DatasetProfiler:
         conditional_fd_error: float = discovery.DEFAULT_CONDITIONAL_FD_ERROR,
         max_rows: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
+        sources: Optional[Dict[str, str]] = None,
     ) -> Spec:
         """Profile several related tables and discover foreign keys.
 
@@ -1365,9 +1412,16 @@ class DatasetProfiler:
         See ``_relationships_from_inds`` for how an IND becomes a foreign key,
         and ``_relationships_from_names`` for the name-based rule that is now
         only the fallback for when the optional discovery extra is absent.
+
+        ``sources`` maps table name -> the file path (or other source label)
+        each ``DataFrame`` came from, so ``metadata.profiling.source`` in the
+        emitted spec records real per-table provenance instead of falling
+        back to the table name. Optional: a caller with only in-memory frames
+        and no file identity can omit it.
         """
         profilers = {
-            t: cls(df, name=t, sample=sample, seed=seed,
+            t: cls(df, name=t, source=(sources or {}).get(t),
+                   sample=sample, seed=seed,
                    max_categorical=max_categorical,
                    max_categorical_ratio=max_categorical_ratio,
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
@@ -1385,7 +1439,7 @@ class DatasetProfiler:
             for t, df in tables.items()
         }
         table_specs = {
-            t: profilers[t]._build_table_spec(df, t, f"profiled:{t}")
+            t: profilers[t]._build_table_spec(df, t, profilers[t].source)
             for t, df in tables.items()
         }
         any_profiler = next(iter(profilers.values()), None)

@@ -155,6 +155,13 @@ class ColumnSpec(BaseModel):
     pii_detected_by: Optional[List[str]] = None
     description: Optional[str] = None
     profile: Optional[ColumnProfile] = None
+    # Evidence for this column's shape (dtype/generator/params/constraints/
+    # profile) when it was produced by the profiler rather than hand-authored.
+    # Mirrors ``TableSpec.key_provenance``: the fingerprint records what the
+    # profiler itself last wrote, so a re-profile can tell a human edit from
+    # an untouched column. None on a hand-authored column.
+    # See ``profiler.merge_preserving_edits``.
+    provenance: Optional[InferenceProvenance] = None
 
 
 class RelationshipSpec(BaseModel):

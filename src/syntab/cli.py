@@ -320,6 +320,7 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         spec = profiler.profile()
     else:
         dfs = {}
+        sources = {}
         for d in datasets:
             profiler = DatasetProfiler.from_file(
                 d, sample=sample, seed=seed, pii_columns=pii_cols,
@@ -327,10 +328,11 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
                 max_rows=max_rows, columns=column_subset, **opts,
             )
             dfs[profiler.name] = profiler.full
+            sources[profiler.name] = profiler.source
         spec = DatasetProfiler.profile_set(
             dfs, name=name, sample=sample, seed=seed,
             pii_columns=pii_cols, pii_strategy=pii_strategy,
-            max_rows=max_rows, columns=column_subset, **opts,
+            max_rows=max_rows, columns=column_subset, sources=sources, **opts,
         )
     if merge_into:
         from .profiler import merge_preserving_edits, MergeReport
@@ -359,7 +361,9 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
                for t in spec.tables)
     n_kept = sum(
         1 for t in spec.tables
-        for prov in [t.key_provenance] + [r.provenance for r in t.relationships]
+        for prov in [t.key_provenance]
+        + [r.provenance for r in t.relationships]
+        + [c.provenance for c in t.columns]
         if prov is not None and prov.human_edited
     )
     click.echo(
@@ -401,7 +405,8 @@ def profile(datasets: tuple, out: str, name: str, sample: int, seed: int,
         if merge_report is not None:
             mr = merge_report.to_dict()
             for key in ("tables_added", "columns_added",
-                        "columns_removed", "columns_changed_reinferred"):
+                        "columns_removed", "columns_changed_kept",
+                        "columns_changed_reinferred"):
                 items = mr.get(key) or []
                 if not items:
                     continue

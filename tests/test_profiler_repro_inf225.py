@@ -373,3 +373,159 @@ def test_merge_repeated_runs_converge_to_columns_preserved():
         for t in first.tables
         for c in t.columns
     )
+
+
+def test_profiled_column_carries_a_fingerprint():
+    """Every column the profiler writes gets a provenance fingerprint, the
+    same scheme key_provenance/relationship provenance already use -- this
+    is what makes column-level drift detection on re-profile possible."""
+    spec = DatasetProfiler(_two_column_frame(), name="t", sample=None).profile()
+    for col in spec.tables[0].columns:
+        assert col.provenance is not None
+        assert col.provenance.algorithm == "profile-column"
+        assert col.provenance.fingerprint
+
+
+def test_merge_preserves_hand_edited_column():
+    """A column edited by hand after profiling survives a re-profile: the
+    edit is kept (not silently overwritten by the fresh inference), and the
+    merge report records it as columns_changed_kept."""
+    df = _two_column_frame()
+    a = DatasetProfiler(df, name="t", sample=None, seed=7).profile()
+
+    status_col = next(c for c in a.tables[0].columns if c.name == "status")
+    original_fingerprint = status_col.provenance.fingerprint
+    # Hand-edit: flip a constraint, as a person correcting the profiler.
+    status_col.constraints["nullable"] = not status_col.constraints.get(
+        "nullable", False
+    )
+
+    b = DatasetProfiler(df, name="t", sample=None, seed=7).profile()
+    mr = MergeReport()
+    merged = merge_preserving_edits(a, b, report=mr)
+
+    merged_status = next(c for c in merged.tables[0].columns if c.name == "status")
+    assert merged_status.constraints["nullable"] == status_col.constraints["nullable"]
+    assert merged_status.provenance.human_edited is True
+    # The fingerprint is stamped stale, not silently refreshed.
+    assert merged_status.provenance.fingerprint == original_fingerprint
+    assert ("t", "status") in mr.columns_changed_kept
+    assert ("t", "status") not in mr.columns_changed_reinferred
+
+
+def test_merge_hand_authored_column_with_no_provenance_is_kept():
+    """A column with no provenance at all (hand-authored, or written before
+    this fingerprinting existed) is treated as human-authored and kept on
+    drift, same as the no-provenance rule for the primary key."""
+    from syntab.spec import ColumnSpec
+
+    df = _two_column_frame()
+    a = DatasetProfiler(df, name="t", sample=None, seed=7).profile()
+    status_col = next(c for c in a.tables[0].columns if c.name == "status")
+    status_col.provenance = None
+    status_col.constraints["nullable"] = not status_col.constraints.get(
+        "nullable", False
+    )
+
+    b = DatasetProfiler(df, name="t", sample=None, seed=7).profile()
+    mr = MergeReport()
+    merged = merge_preserving_edits(a, b, report=mr)
+    merged_status = next(c for c in merged.tables[0].columns if c.name == "status")
+    assert merged_status.constraints["nullable"] == status_col.constraints["nullable"]
+    assert ("t", "status") in mr.columns_changed_kept
+
+
+# ---------------------------------------------------------------------------
+# Follow-up fixes found in code review of the initial INF-225 PR
+# ---------------------------------------------------------------------------
+
+def test_profile_set_records_real_source_per_table(tmp_path):
+    """Multi-table profiling records each table's own file identity, not
+    'unknown' -- the ``sources`` mapping threads the real path through."""
+    users_p = tmp_path / "users.csv"
+    orders_p = tmp_path / "orders.csv"
+    users_p.write_text("id,name\n1,a\n2,b\n")
+    orders_p.write_text("id,user_id,amount\n10,1,1.0\n11,2,2.0\n")
+
+    dfs = {}
+    sources = {}
+    for tname, p in (("users", users_p), ("orders", orders_p)):
+        prof = DatasetProfiler.from_file(str(p), name=tname)
+        dfs[prof.name] = prof.full
+        sources[prof.name] = prof.source
+
+    spec = DatasetProfiler.profile_set(
+        dfs, sample=None, discover=False, sources=sources
+    )
+    for t in spec.tables:
+        src = t.metadata["profiling"]["source"]
+        assert src["source"] == sources[t.name]
+        assert src["source_path"] == sources[t.name]
+        assert "source_size_bytes" in src
+        assert "source_mtime" in src
+
+
+def test_profile_set_without_sources_falls_back_to_unknown():
+    """Callers with only in-memory frames (no ``sources`` mapping) keep the
+    previous behavior instead of erroring."""
+    spec = DatasetProfiler.profile_set(
+        {"users": pd.DataFrame({"id": [1, 2], "name": ["a", "b"]})},
+        sample=None, discover=False,
+    )
+    assert spec.tables[0].metadata["profiling"]["source"]["source"] == "unknown"
+
+
+def test_read_dataframe_bounded_handles_jsonl_without_bounds(tmp_path):
+    """JSONL profiles the same way whether or not --max-rows/--columns is
+    set -- the default (whole-file) dispatch used to raise on .jsonl."""
+    p = tmp_path / "wide.jsonl"
+    p.write_text("\n".join(json.dumps({"i": i, "v": i * 2}) for i in range(5)))
+    df = _read_dataframe_bounded(str(p))
+    assert len(df) == 5
+    assert list(df.columns) == ["i", "v"]
+
+
+def test_read_dataframe_bounded_parses_tsv_with_tab_separator(tmp_path):
+    p = tmp_path / "data.tsv"
+    p.write_text("id\tval\n1\t10\n2\t20\n")
+    df = _read_dataframe_bounded(str(p))
+    assert list(df.columns) == ["id", "val"]
+    assert len(df) == 2
+
+
+def test_read_dataframe_bounded_parses_tsv_when_capped(tmp_path):
+    p = tmp_path / "data.tsv"
+    p.write_text("id\tval\n" + "\n".join(f"{i}\t{i * 2}" for i in range(10)))
+    df = _read_dataframe_bounded(str(p), max_rows=3)
+    assert list(df.columns) == ["id", "val"]
+    assert len(df) == 3
+
+
+def test_read_dataframe_bounded_rejects_unknown_columns_streamed(tmp_path):
+    p = tmp_path / "data.csv"
+    p.write_text("id,val\n1,10\n2,20\n")
+    with pytest.raises(ValueError, match="val1"):
+        _read_dataframe_bounded(str(p), columns=["id", "val1"])
+
+
+def test_read_dataframe_bounded_rejects_unknown_columns_whole_load(tmp_path):
+    p = tmp_path / "data.json"
+    p.write_text(json.dumps([{"id": 1, "val": 10}, {"id": 2, "val": 20}]))
+    with pytest.raises(ValueError, match="val1"):
+        _read_dataframe_bounded(str(p), columns=["id", "val1"])
+
+
+def test_controls_never_duplicates_sample_or_seed():
+    """sample/seed are always recorded via requested_sample/seed and must
+    never also appear in `controls` -- including at CLI-realistic non-None
+    values (sample=5000, seed=42), which is exactly the case the original
+    'controls omitted at defaults' contract failed to cover."""
+    spec = DatasetProfiler(
+        _two_column_frame(), name="t", sample=5000, seed=42,
+    ).profile()
+    ctrls = spec.tables[0].metadata["profiling"].get("controls", {})
+    assert "sample" not in ctrls
+    assert "seed" not in ctrls
+    profiling_meta = spec.tables[0].metadata["profiling"]
+    assert profiling_meta["requested_sample"] == 5000
+    assert profiling_meta["seed"] == 42

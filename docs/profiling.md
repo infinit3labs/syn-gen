@@ -30,14 +30,20 @@ anything:
 The two new flags are the documented way to bound what ``profile`` reads
 into memory:
 
-- ``--max-rows N`` -- read at most ``N`` rows from each input. CSV, TSV,
-  and JSONL stream in chunks of 50 000 rows; the row cap is applied as
-  the chunks come in. Parquet, JSON, and Excel are loaded whole and then
-  truncated, since the underlying readers do not expose ``chunksize``;
-  documented in the help text and the function docstring.
+- ``--max-rows N`` -- read at most ``N`` rows from each input. CSV
+  (``.csv``/``.txt``), TSV (``.tsv``), and JSONL (``.jsonl``) stream in
+  chunks of 50 000 rows; the row cap is applied as the chunks come in.
+  Parquet, JSON, and Excel are loaded whole and then truncated, since the
+  underlying readers do not expose ``chunksize``; documented in the help
+  text and the function docstring. JSONL profiles the same way whether or
+  not ``--max-rows``/``--columns`` is set -- both the bounded and the
+  default (whole-file) read path recognise it.
 - ``--columns id,val,score`` -- comma-separated column subset. Applied
   *before* ``--max-rows``, so ``--max-rows`` is a cap on the columns you
-  asked for, not on the whole file.
+  asked for, not on the whole file. A name that does not exist in the
+  source is an error (naming every requested column that was not found),
+  not a silent drop -- a typo in ``--columns`` used to produce a spec
+  quietly missing the intended column.
 
 Important: when ``--max-rows`` is set, the row cap replaces the previous
 "full dataset" assumption for nullability and uniqueness. ``null_rate``,
@@ -84,16 +90,28 @@ decides what to keep:
 | table in old, not new | **kept**, recorded in ``merge.tables_removed`` |
 | table in new, not old | **added**, recorded in ``merge.tables_added`` |
 | column in old + new, same shape | fresh column wins, recorded in ``merge.columns_preserved`` |
-| column in old + new, **different** shape | fresh column wins, recorded in ``merge.columns_changed_reinferred`` |
+| column in old + new, different shape, no human edit detected | fresh column wins, recorded in ``merge.columns_changed_reinferred`` |
+| column in old + new, different shape, human edit detected | **kept**, marked ``human_edited``, recorded in ``merge.columns_changed_kept`` |
 | column in old, not in new | **kept**, recorded in ``merge.columns_removed`` |
 | column in new, not in old | **added**, recorded in ``merge.columns_added`` |
+
+Every column the profiler writes carries a ``provenance.fingerprint`` (the
+same scheme ``key_provenance``/relationship ``provenance`` already use) --
+a digest of the column's own shape (``dtype``, ``generator``, ``params``,
+``constraints``, ``profile``) at the moment the profiler wrote it. On a
+re-profile, a drifted column is checked against that fingerprint: if the
+column in the old spec still matches what the profiler last wrote, nobody
+touched it and the fresh inference wins (``columns_changed_reinferred``);
+if it no longer matches, or carries no fingerprint at all (hand-authored),
+a human is assumed to have edited it, and the edit is kept
+(``columns_changed_kept``).
 
 The merge report is attached to the merged spec's
 ``metadata.merge`` and printed by the CLI. A column whose shape drifted
 is *not* silently re-inferred away from a hand edit; the next re-profile
 that finds the column stable will mark it ``columns_preserved`` instead
-of ``columns_changed_reinferred``, so the report converges with a
-second pass.
+of ``columns_changed_reinferred`` or ``columns_changed_kept``, so the
+report converges with a second pass.
 
 The drift signature is the data-facing shape:
 ``dtype``, ``generator``, ``params``, ``constraints``, and the column
