@@ -24,6 +24,8 @@ import pandas as pd
 from .rules import compile_rules
 from .spec import Spec, expand_many_to_many
 
+REPORT_SCHEMA_VERSION = "1"
+
 
 @dataclass
 class Check:
@@ -75,9 +77,24 @@ class SpecConformance:
                 lines.append(line)
         return "\n".join(lines)
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, compact: bool = False) -> dict:
+        summary = {
+            "report_type": "conformance",
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+            "status": "pass" if self.overall_ok else "fail",
             "overall_ok": self.overall_ok,
+            "table_count": len(self.tables),
+        }
+        if compact:
+            checks = [c for t in self.tables for c in t.checks]
+            summary.update({
+                "pass_count": sum(c.status == "pass" for c in checks),
+                "warn_count": sum(c.status == "warn" for c in checks),
+                "fail_count": sum(c.status == "fail" for c in checks),
+            })
+            return summary
+        return {
+            **summary,
             "tables": [
                 {
                     "table": t.table,

@@ -54,6 +54,8 @@ from .quality import (
 )
 from .spec import Spec
 
+REPORT_SCHEMA_VERSION = "1"
+
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -81,8 +83,20 @@ class ValidationReport:
     mean_distance: float = 0.0
     overall_pass: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, compact: bool = False) -> Dict[str, Any]:
         d = asdict(self)
+        d["report_type"] = "comparison"
+        d["report_schema_version"] = REPORT_SCHEMA_VERSION
+        d["status"] = "pass" if self.overall_pass else "fail"
+        if compact:
+            return {
+                key: d[key]
+                for key in (
+                    "report_type", "report_schema_version", "status",
+                    "overall_pass", "real_rows", "synthetic_rows",
+                    "n_pass", "n_warn", "n_fail", "mean_distance",
+                )
+            }
         d["overall_pass"] = self.overall_pass
         return d
 

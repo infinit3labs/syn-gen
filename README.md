@@ -23,6 +23,7 @@ properties without copying source rows into the generated output.
 - [Disclosure and privacy](#disclosure-posture-read-before-committing-a-profiled-spec)
 - [Examples and documentation](#examples-and-documentation)
 - [Development](#development)
+- [CI and release checks](#ci-and-release-checks)
 - [License](#license)
 
 ## Features
@@ -80,6 +81,10 @@ syntab check \
 
 The `output/` directory is ignored by Git, so local runs do not add generated
 datasets to a checkout.
+
+For CI, `quality`, `diagnose`, and `check` can write versioned machine-readable
+reports with `--out`; add `--compact` for a stable summary without per-column
+details. See [docs/ci.md](docs/ci.md) for exit codes and release-gate examples.
 
 ## Library
 ```python
@@ -300,6 +305,10 @@ Every inferred rule records which algorithm produced it, over how many rows,
 and how strong the evidence was -- and `--merge-into` lets you re-profile
 without losing hand edits.
 
+Profile artifacts also record a deterministic fingerprint of the bounded sample
+and schema. Re-profiling records added, removed, and changed columns as schema
+drift metadata for review.
+
 **Desbordante, which provides the algorithms, is AGPL-3.0-only and ships no
 Windows wheel**, which is why it is an optional extra. Profiling works without
 it, falling back to the name-based rules and saying so in the spec.
@@ -317,7 +326,13 @@ Mark PII when profiling (auto-detected for email/phone/SSN-like columns):
 
 ```bash
 syntab profile data.csv --pii email,name --pii-strategy faker --out spec.yaml
+syntab profile data.csv --pii-ignore product_name --out spec.yaml
 ```
+
+Use `--pii-ignore` only for reviewed false positives; explicit `--pii` names
+always take precedence. Disclosure budgets fail the profile by default, or
+can be emitted as warnings with `--disclosure-mode warning` and a JSON report
+via `--disclosure-out`.
 
 Or set it directly in the Spec via `pii: true` + `pii_strategy`:
 
