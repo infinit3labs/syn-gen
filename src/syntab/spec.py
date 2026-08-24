@@ -16,6 +16,17 @@ class SpecError(Exception):
     pass
 
 
+# The public wire-format version.  Keep this separate from metadata.version:
+# the latter identifies a user's dataset/spec revision, while this identifies
+# the shape and semantics of the Spec document itself.
+CURRENT_SPEC_VERSION = "1.0"
+SUPPORTED_SPEC_VERSIONS = frozenset({CURRENT_SPEC_VERSION})
+
+
+class SpecVersionError(SpecError, ValueError):
+    """Raised when a Spec needs an unsupported or lossy migration."""
+
+
 class SpecMetadata(BaseModel):
     name: str
     version: str = "1.0.0"
@@ -236,7 +247,7 @@ class Settings(BaseModel):
 
 
 class Spec(BaseModel):
-    spec_version: str = "1.0"
+    spec_version: str = CURRENT_SPEC_VERSION
     metadata: SpecMetadata
     settings: Settings = Field(default_factory=Settings)
     tables: List[TableSpec]

@@ -10,6 +10,8 @@ from .spec import (
     NumericProfile,
     CategoricalProfile,
     WhenClause,
+    CURRENT_SPEC_VERSION,
+    SpecVersionError,
 )
 from .loaders import from_file, from_dict, to_file
 from .engine import GenerationEngine, GenerationResult, SpecError, RuleViolation
@@ -20,7 +22,7 @@ from .generators import (
     empirical_text_params,
 )
 from .infer import fit_text_params
-from .profiler import DatasetProfiler
+from .profiler import DatasetProfiler, merge_preserving_edits, schema_drift
 from .validator import validate, ValidationReport
 from .quality import (
     quality_report,
@@ -38,11 +40,13 @@ from .conformance import (
 __all__ = [
     "Spec", "SpecMetadata", "Settings", "TableSpec", "ColumnSpec",
     "RelationshipSpec", "ColumnProfile", "NumericProfile", "CategoricalProfile", "WhenClause",
+    "CURRENT_SPEC_VERSION", "SpecVersionError",
     "from_file", "from_dict", "to_file",
     "GenerationEngine", "GenerationResult", "SpecError", "RuleViolation",
     "BaseGenerator", "register_generator", "get_registry",
     "empirical_text_params", "fit_text_params",
     "DatasetProfiler",
+    "merge_preserving_edits", "schema_drift",
     "validate", "ValidationReport",
     "quality_report", "diagnostic_report", "QualityReport", "DiagnosticReport",
     "validate_against_spec", "SpecConformance", "TableConformance", "Check",

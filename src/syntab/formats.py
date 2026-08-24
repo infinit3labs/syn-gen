@@ -230,7 +230,10 @@ class CSVSink(RowSink):
             return
         path = self.dir / f"{name}.csv"
         df = pd.DataFrame(rows)
-        df.to_csv(path, index=False, header=name not in self._written, mode="a")
+        first = name not in self._written
+        # A sink represents one generation run.  Truncate a stale file on its
+        # first write so rerunning a spec cannot silently duplicate rows.
+        df.to_csv(path, index=False, header=first, mode="w" if first else "a")
         self._written.add(name)
 
 
@@ -240,11 +243,14 @@ class JSONLSink(RowSink):
     def __init__(self, out_dir: str):
         self.dir = Path(out_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._written: set = set()
 
     def write_table(self, name: str, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             return
         path = self.dir / f"{name}.jsonl"
-        with path.open("a", encoding="utf-8") as f:
+        mode = "w" if name not in self._written else "a"
+        with path.open(mode, encoding="utf-8") as f:
             for r in rows:
                 f.write(json.dumps(_serialize_row(r)) + "\n")
+        self._written.add(name)

@@ -82,6 +82,8 @@ import pandas as pd
 
 from .spec import Spec
 
+REPORT_SCHEMA_VERSION = "1"
+
 # Rows sampled before computing the O(n_cols^2) pair-trend metrics and the
 # character-distribution metrics. SDMetrics exposes the same control as
 # ``num_rows_subsample``. Pair trends on a 200k-row source with 18 columns is
@@ -504,15 +506,23 @@ class QualityReport:
     def get_property(self, name: str) -> Optional[Property]:
         return next((p for p in self.properties if p.name == name), None)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, compact: bool = False) -> Dict[str, Any]:
         both = self.overall_score_all_properties
-        return {
+        summary = {
+            "report_type": "quality",
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+            "status": "measured",
             "overall_score": None if math.isnan(self.overall_score) else round(self.overall_score, 4),
             "overall_score_all_properties": None if math.isnan(both) else round(both, 4),
             "scored_properties": [p.name for p in self.properties if p.contributes],
             "excluded_key_columns": list(self.excluded_key_columns),
             "real_rows": self.real_rows,
             "synthetic_rows": self.synthetic_rows,
+        }
+        if compact:
+            return summary
+        return {
+            **summary,
             "properties": [
                 {
                     "name": p.name,
@@ -622,12 +632,21 @@ class DiagnosticReport:
     def failures(self) -> List[DiagnosticResult]:
         return [r for p in self.properties for r in p.results if not r.ok]
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, compact: bool = False) -> Dict[str, Any]:
+        summary = {
+            "report_type": "diagnostic",
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+            "status": "pass" if self.overall_ok else "fail",
             "overall_ok": self.overall_ok,
             "real_rows": self.real_rows,
             "synthetic_rows": self.synthetic_rows,
             "tolerance": self.tolerance,
+        }
+        if compact:
+            summary["failure_count"] = len(self.failures())
+            return summary
+        return {
+            **summary,
             "properties": [
                 {
                     "name": p.name,

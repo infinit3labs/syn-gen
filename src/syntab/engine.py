@@ -893,7 +893,12 @@ class GenerationEngine:
                     rng, rng_np, table.row_count,
                 )
                 if stream_sink is not None and chunk_size is not None and not ordered_table:
-                    stream_buffer.extend(rows)
+                    # Flush the vectorized batch in the same bounded chunks
+                    # as the row-wise path.  The batch is still materialized
+                    # for vectorized generation, but the sink never receives
+                    # an unbounded single write.
+                    for start in range(0, len(rows), chunk_size):
+                        emit_chunk(rows[start:start + chunk_size])
             else:
                 for i in range(table.row_count):
                     if m2m is not None:

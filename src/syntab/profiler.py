@@ -12,6 +12,8 @@ round-trip). Built-in logic only; no external ML required.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -608,6 +610,54 @@ def _mark_edited(prov: Optional[InferenceProvenance]) -> InferenceProvenance:
     return updated
 
 
+def _schema_snapshot(table: TableSpec) -> Dict[str, str]:
+    profiling = (table.metadata or {}).get("profiling") or {}
+    recorded = profiling.get("schema")
+    if isinstance(recorded, list):
+        return {
+            str(item.get("name")): str(item.get("dtype"))
+            for item in recorded if isinstance(item, dict) and "name" in item
+        }
+    if isinstance(recorded, str):
+        snapshot: Dict[str, str] = {}
+        for item in recorded.split("|"):
+            name, separator, dtype = item.partition(":")
+            if separator:
+                snapshot[name] = dtype
+        if snapshot:
+            return snapshot
+    return {c.name: c.dtype for c in table.columns}
+
+
+def schema_drift(existing: Spec, profiled: Spec) -> Dict[str, Dict[str, Any]]:
+    """Return added, removed, and type-changed columns between profiles."""
+    result: Dict[str, Dict[str, Any]] = {}
+    old_tables = {t.name: t for t in existing.tables}
+    for fresh in profiled.tables:
+        old = old_tables.get(fresh.name)
+        if old is None:
+            result[fresh.name] = {"table_added": True}
+            continue
+        before, after = _schema_snapshot(old), _schema_snapshot(fresh)
+        added = sorted(set(after) - set(before))
+        removed = sorted(set(before) - set(after))
+        changed = sorted(
+            name for name in set(before) & set(after) if before[name] != after[name]
+        )
+        if added or removed or changed:
+            result[fresh.name] = {
+                "added": added,
+                "removed": removed,
+                "changed": [
+                    {"name": name, "from": before[name], "to": after[name]}
+                    for name in changed
+                ],
+            }
+    for name in sorted(set(old_tables) - {t.name for t in profiled.tables}):
+        result[name] = {"table_removed_from_profile": True}
+    return result
+
+
 def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
     """Fold a fresh profile into an existing spec, keeping human corrections.
 
@@ -617,9 +667,15 @@ def merge_preserving_edits(existing: Spec, profiled: Spec) -> Spec:
     ever preserved would be as useless as one that only ever overwrote.
     """
     merged = profiled.model_copy(deep=True)
+    drift = schema_drift(existing, profiled)
     old_tables = {t.name: t for t in existing.tables}
 
     for table in merged.tables:
+        if table.name in drift:
+            table.metadata = dict(table.metadata or {})
+            profiling = dict(table.metadata.get("profiling") or {})
+            profiling["schema_drift"] = drift[table.name]
+            table.metadata["profiling"] = profiling
         old = old_tables.get(table.name)
         if old is None:
             continue
@@ -677,6 +733,7 @@ class DatasetProfiler:
         max_categorical_ratio: float = DEFAULT_MAX_CATEGORICAL_RATIO,
         max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
+        pii_exclude_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
@@ -706,6 +763,7 @@ class DatasetProfiler:
         self.max_categorical_ratio = max_categorical_ratio
         self.max_categorical_ratio_cap = max_categorical_ratio_cap
         self.pii_columns = set(pii_columns or [])
+        self.pii_exclude_columns = set(pii_exclude_columns or [])
         self.pii_strategy = pii_strategy
         self.redact_categoricals = redact_categoricals
         self.min_cell_count = max(0, int(min_cell_count))
@@ -884,6 +942,11 @@ class DatasetProfiler:
             "source_row_count": source_rows,
             "sampled_rows": n,
             "sampled": n < source_rows,
+            # Compact on purpose: this provenance is emitted in every profile
+            # and should not overwhelm the human-edited Spec itself.
+            "schema": "|".join(
+                f"{column}:{df[column].dtype}" for column in df.columns
+            ),
         }
         if self.sample is not None:
             profiling_metadata["requested_sample"] = self.sample
@@ -893,6 +956,40 @@ class DatasetProfiler:
             profiling_metadata["identifying_key_candidates"] = list(
                 self.identifying_key_candidates
             )
+        # A stable, non-reversible run fingerprint makes it possible to tell
+        # whether a spec was rebuilt from the same input shape/sample without
+        # embedding source values in the artifact.  Hash only bounded sample
+        # rows even when the caller supplied a very large DataFrame.
+        sample_for_fingerprint = df.head(1000)
+        try:
+            row_hash = pd.util.hash_pandas_object(
+                sample_for_fingerprint, index=True
+            ).astype("uint64").tolist()
+        except (TypeError, ValueError):
+            row_hash = [str(row) for row in sample_for_fingerprint.itertuples()]
+        fingerprint_input = {
+            "source_rows": source_rows,
+            "schema": profiling_metadata["schema"],
+            "sample_rows": n,
+            "sample": self.sample,
+            "seed": self.seed,
+            "options": {
+                "max_categorical": self.max_categorical,
+                "max_categorical_ratio": self.max_categorical_ratio,
+                "min_cell_count": self.min_cell_count,
+                "redact_categoricals": self.redact_categoricals,
+                "pii_columns": sorted(self.pii_columns),
+                "pii_exclude_columns": sorted(self.pii_exclude_columns),
+                "pii_strategy": self.pii_strategy,
+                "discover": self.discover,
+                "discover_fds": self.discover_fds,
+                "condition_on_fds": self.condition_on_fds,
+            },
+            "sample_hash": row_hash,
+        }
+        profiling_metadata["fingerprint"] = hashlib.sha256(
+            json.dumps(fingerprint_input, sort_keys=True, default=str).encode()
+        ).hexdigest()
 
         return TableSpec(
             name=name,
@@ -922,6 +1019,7 @@ class DatasetProfiler:
         max_categorical_ratio: float = DEFAULT_MAX_CATEGORICAL_RATIO,
         max_categorical_ratio_cap: int = DEFAULT_MAX_CATEGORICAL_RATIO_CAP,
         pii_columns: Optional[List[str]] = None,
+        pii_exclude_columns: Optional[List[str]] = None,
         pii_strategy: str = "faker",
         redact_categoricals: bool = False,
         min_cell_count: int = DEFAULT_MIN_CELL_COUNT,
@@ -949,6 +1047,7 @@ class DatasetProfiler:
                    max_categorical_ratio=max_categorical_ratio,
                    max_categorical_ratio_cap=max_categorical_ratio_cap,
                    pii_columns=pii_columns, pii_strategy=pii_strategy,
+                   pii_exclude_columns=pii_exclude_columns,
                    redact_categoricals=redact_categoricals,
                    min_cell_count=min_cell_count,
                    discover=discover, discover_fds=discover_fds,
@@ -1407,9 +1506,13 @@ class DatasetProfiler:
 
         if name in self.pii_columns:
             signals.append(PII_SIGNAL_EXPLICIT)
-        if name_provider:
+        # Explicit exclusion suppresses heuristic signals, but never defeats
+        # an explicit --pii selection: an operator's direct classification is
+        # stronger than an automatic guess.
+        excluded = name in self.pii_exclude_columns and name not in self.pii_columns
+        if name_provider and not excluded:
             signals.append(PII_SIGNAL_NAME)
-        if value_provider:
+        if value_provider and not excluded:
             signals.append(PII_SIGNAL_VALUE)
 
         # An id-like column whose base name looks identifying (patient_id,
