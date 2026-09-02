@@ -18,8 +18,15 @@ jobs:
         run: python -m pytest -q
       - name: Exercise the CLI examples
         run: |
+          syntab validate --spec examples/demos/01_basic_single_table.yaml
           syntab validate --spec examples/demos/02_basic_relational.yaml
+          syntab validate --spec examples/demos/03_advanced_custom_generators.yaml
+          syntab validate --spec examples/demos/04_advanced_business_rules.yaml
           syntab generate --spec examples/demos/02_basic_relational.yaml \
             --out /tmp/syntab-ci-output --format csv --stream --chunk-size 32
           syntab check --spec examples/demos/02_basic_relational.yaml \
             --data /tmp/syntab-ci-output --out /tmp/syntab-conformance.json --compact
+          syntab generate --spec examples/demos/03_advanced_custom_generators.yaml \
+            --out /tmp/syntab-custom-output --format csv
+          syntab generate --spec examples/demos/04_advanced_business_rules.yaml \
+            --out /tmp/syntab-rules-output --format csv
