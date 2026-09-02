@@ -5,7 +5,8 @@ Before publishing a release:
 1. Update `[project].version` in `pyproject.toml` and record the user-visible
    changes in the release notes.
 2. Keep `Spec.spec_version` at the current wire-format version unless a
-   migration is implemented and compatibility fixtures are added.
+   migration is implemented and compatibility fixtures are added, per the
+   policy in [docs/spec-versioning.md](spec-versioning.md).
 3. Run `python -m pytest -q` in a fresh environment with the core and `dev`
    extras.
 4. Exercise `syntab validate`, streamed `syntab generate`, and `syntab check`
