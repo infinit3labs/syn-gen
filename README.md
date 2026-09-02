@@ -22,6 +22,7 @@ properties without copying source rows into the generated output.
 - [Profiling and evaluation](#profiling-an-existing-dataset)
 - [Disclosure and privacy](#disclosure-posture-read-before-committing-a-profiled-spec)
 - [Examples and documentation](#examples-and-documentation)
+- [Changelog](#changelog)
 - [Development](#development)
 - [CI and release checks](#ci-and-release-checks)
 - [License](#license)
@@ -638,6 +639,12 @@ The repository is intentionally organized around the public workflow:
 Start with the [basic demo](examples/demos/01_basic_single_table.yaml), then
 read the [demo guide](examples/demos/README.md). The longer sections below are
 reference material for advanced Specs and production-shaped test fixtures.
+
+## Changelog
+
+User-visible changes are recorded in [CHANGELOG.md](CHANGELOG.md). Releases
+follow the version in `pyproject.toml`; the wire-format compatibility policy
+for `spec_version` is documented in [docs/spec-versioning.md](docs/spec-versioning.md).
 
 ## Mock specs (rules, constraints, key consistency)
 `examples/mock_specs/` demonstrates the business-rule DSL and constraint system

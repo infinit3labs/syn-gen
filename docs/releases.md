@@ -3,7 +3,7 @@
 Before publishing a release:
 
 1. Update `[project].version` in `pyproject.toml` and record the user-visible
-   changes in the release notes.
+   changes under the matching version in [CHANGELOG.md](../CHANGELOG.md).
 2. Keep `Spec.spec_version` at the current wire-format version unless a
    migration is implemented and compatibility fixtures are added, per the
    policy in [docs/spec-versioning.md](spec-versioning.md).
@@ -16,3 +16,12 @@ Before publishing a release:
    required for core profiling.
 6. Do not commit source datasets, profiled Specs derived from private data,
    generated output, or disclosure reports containing source-derived values.
+
+## Versioning convention
+
+syntab uses [Semantic Versioning](https://semver.org/): patch releases are
+backward-compatible fixes, minor releases add backward-compatible features,
+and major releases may remove or change public behavior. A release tag must
+match `[project].version` (for example, `v0.1.0`). Keep the changelog's
+`[Unreleased]` section at the top and move it under the new version when
+tagging a release.

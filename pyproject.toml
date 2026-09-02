@@ -8,6 +8,22 @@ version = "0.1.0"
 description = "Spec-driven synthetic tabular/relational data generator with custom generators, a business-rule DSL, and profiling-ready Specs."
 readme = "README.md"
 license = { file = "LICENSE" }
+authors = [{ name = "Infinite Labs" }]
+keywords = ["synthetic-data", "tabular-data", "relational-data", "data-generation", "profiling"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+]
+project-urls = { Homepage = "https://github.com/infinit3labs/syn-gen", Repository = "https://github.com/infinit3labs/syn-gen", Issues = "https://github.com/infinit3labs/syn-gen/issues" }
 requires-python = ">=3.9"
 dependencies = [
     "pydantic>=2.0",
