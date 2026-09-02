@@ -365,13 +365,25 @@ current table plus the parents it still needs, instead of the whole dataset:
 syntab generate --spec spec.yaml --out big_out/ --stream          # csv
 syntab generate --spec spec.yaml --out big_out/ --stream --format jsonl
 syntab generate --spec spec.yaml --out big_out/ --stream --chunk-size 10000
+syntab generate --spec spec.yaml --out big_out/ --stream --progress
 ```
 
+`--progress` prints each table's `emitted/total` row count to stderr as
+chunks are written. The CLI stages streamed output in a temp directory next
+to `--out` and only publishes it (an atomic rename) once generation finishes
+without error; a failed or interrupted run leaves any prior `--out` untouched
+and no partial/staging directory behind, so a truncated table never sits at
+the final path looking like a complete run — check the exit code, not just
+whether `--out` exists.
+
 Programmatic sinks (`formats.CSVSink`, `formats.JSONLSink`, or any object with
-a `write_table(name, rows)` method) can be passed to
-`GenerationEngine.run(stream_sink=..., chunk_size=10000)`. A supplied
-`progress(table, emitted, total)` callback runs after each successful write;
-generation errors propagate and previously written chunks remain on disk.
+a `write_table(name, rows)` method) can be passed directly to
+`GenerationEngine.run(stream_sink=..., chunk_size=10000)`. At that lower
+level there is no staging/publish step: a supplied `progress(table, emitted,
+total)` callback runs after each successful write, generation errors
+propagate, and previously written chunks remain on disk at the sink's own
+path — the CLI's atomic-publish behavior above is a wrapper around this, not
+a property of the engine itself.
 
 ## Conditional generation
 
@@ -621,6 +633,7 @@ The repository is intentionally organized around the public workflow:
 | `docs/discovery.md` | Optional dependency and relationship discovery |
 | `docs/quality.md` | Fidelity, validity, and conformance reports |
 | `docs/disclosure.md` | What profiling records and how to review it safely |
+| `docs/spec-versioning.md` | `spec_version` compatibility policy and migration |
 
 Start with the [basic demo](examples/demos/01_basic_single_table.yaml), then
 read the [demo guide](examples/demos/README.md). The longer sections below are

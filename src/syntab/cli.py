@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
+import tempfile
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict
@@ -30,7 +33,10 @@ from .discovery import (
     DEFAULT_IND_ERROR,
     DEFAULT_MIN_MU,
 )
-from .spec import Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings
+from .spec import (
+    Spec, TableSpec, ColumnSpec, RelationshipSpec, SpecMetadata, Settings,
+    SUPPORTED_SPEC_VERSIONS,
+)
 
 try:
     _TOOL_VERSION = version("syntab")
@@ -60,6 +66,50 @@ def _write_report(path: str, report: dict, *, inputs: Dict[str, str],
                           encoding="utf-8")
 
 
+def _generate_streamed(engine: GenerationEngine, spec: Spec, out: str, eff_fmt: str,
+                       chunk_size: int | None, vectorized: bool, progress: bool) -> None:
+    """Stream generation into a staging directory, then publish it atomically.
+
+    A run that fails partway through must not leave a truncated table sitting
+    at the final ``out`` path -- that would look like a small-but-complete
+    dataset rather than a failed one. Writes land in a sibling temp directory
+    first; ``out`` is only replaced once generation finishes without error,
+    and any prior ``out`` is restored if the final swap itself fails.
+    """
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{out_path.name}.staging-",
+                                    dir=out_path.parent))
+
+    def _report(table: str, emitted: int, total: int) -> None:
+        click.echo(f"  {table}: {emitted}/{total}", err=True)
+
+    sink = formats.CSVSink(str(staging)) if eff_fmt == "csv" else formats.JSONLSink(str(staging))
+    try:
+        engine.run(stream_sink=sink, vectorized=vectorized, chunk_size=chunk_size,
+                   progress=_report if progress else None)
+        sink.close()
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    backup = None
+    if out_path.exists():
+        backup = out_path.parent / f".{out_path.name}.bak-{os.getpid()}"
+        out_path.rename(backup)
+    try:
+        staging.rename(out_path)
+    except Exception:
+        if backup is not None:
+            backup.rename(out_path)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+    total = sum(t.row_count for t in spec.tables)
+    click.echo(f"Streamed {total} rows across {len(spec.tables)} table(s) to {out}")
+
+
 @click.group()
 def cli() -> None:
     """syntab — Spec-driven synthetic tabular data generator."""
@@ -75,12 +125,16 @@ def cli() -> None:
                    "directory output; lower memory for large datasets).")
 @click.option("--chunk-size", default=None, type=int,
               help="Rows per streamed sink write. Defaults to one write per table.")
+@click.option("--progress", is_flag=True,
+              help="Print per-table row counts to stderr as streamed generation "
+                   "progresses. Only meaningful with --stream.")
 @click.option("--vectorized", is_flag=True,
               help="Use the column-wise fast path where possible (tables with "
                    "rules/dependencies/Faker/self-refs/M2M/uniqueness fall back "
                    "to row-by-row generation).")
 def generate(spec_path: str, out: str, fmt: str | None, seed: int | None,
-             stream: bool, chunk_size: int | None, vectorized: bool) -> None:
+             stream: bool, chunk_size: int | None, progress: bool,
+             vectorized: bool) -> None:
     """Generate data from a Spec."""
     spec = from_file(spec_path)
     if seed is not None:
@@ -92,11 +146,8 @@ def generate(spec_path: str, out: str, fmt: str | None, seed: int | None,
             if eff_fmt not in ("csv", "jsonl"):
                 click.echo("Error: --stream only supports csv or jsonl.", err=True)
                 sys.exit(2)
-            sink = formats.CSVSink(out) if eff_fmt == "csv" else formats.JSONLSink(out)
-            engine.run(stream_sink=sink, vectorized=vectorized, chunk_size=chunk_size)
-            sink.close()
-            total = sum(t.row_count for t in spec.tables)
-            click.echo(f"Streamed {total} rows across {len(spec.tables)} table(s) to {out}")
+            _generate_streamed(engine, spec, out, eff_fmt, chunk_size,
+                                vectorized, progress)
             return
         result = engine.run(vectorized=vectorized)
     except (SpecError, Exception) as e:
@@ -167,18 +218,27 @@ def init() -> None:
 @click.option("--migrate-out", default=None, type=click.Path(),
               help="Write the normalized current-version Spec to this path.")
 def validate(spec_path: str, migrate_out: str | None) -> None:
-    """Validate a Spec (structure + references + rule syntax)."""
+    """Validate a Spec (structure + references + rule syntax).
+
+    Loading already normalizes any supported legacy ``spec_version`` to the
+    current wire format (see docs/spec-versioning.md); an unsupported version
+    fails here with a precise error rather than being silently misread.
+    """
     try:
         spec = from_file(spec_path)
         GenerationEngine(spec)
     except Exception as e:
         click.echo(f"Invalid: {e}", err=True)
         sys.exit(1)
+    supported = ", ".join(sorted(SUPPORTED_SPEC_VERSIONS))
     if migrate_out:
         to_file(spec, migrate_out)
-        click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables); migrated to {migrate_out}")
+        click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables; "
+                   f"spec_version={spec.spec_version}, supported={supported}); "
+                   f"migrated to {migrate_out}")
     else:
-        click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables; spec_version={spec.spec_version})")
+        click.echo(f"OK: {spec.metadata.name} ({len(spec.tables)} tables; "
+                   f"spec_version={spec.spec_version}, supported={supported})")
 
 
 @cli.command()
